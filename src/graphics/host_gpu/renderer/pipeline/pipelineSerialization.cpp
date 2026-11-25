@@ -69,7 +69,8 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	}
 	Writer header;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize,
+	      ShaderRecompiler::Spirv::LoopCap());
 	return std::move(header.bytes);
 }
 

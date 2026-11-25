@@ -95,8 +95,55 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+bool IsLoopMergeBlock(const IR::Program& program, const IR::Block* target) {
+	return target != nullptr && std::ranges::any_of(program.blocks, [&](const IR::Block* other) {
+		return other->terminator.loop_header && other->terminator.merge_block == target;
+	});
+}
+
+uint32_t LoopBudgetExhausted(EmitterState& state) {
+	const auto budget = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), exhausted, budget,
+	                          ConstantU32(state, 0));
+	return exhausted;
+}
+
+void DecrementLoopBudget(EmitterState& state) {
+	const auto budget = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), budget, state.loop_budget_variable);
+	const auto nonzero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), nonzero, budget,
+	                          ConstantU32(state, 0));
+	const auto step = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), step, nonzero, ConstantU32(state, 1),
+	                          ConstantU32(state, 0));
+	const auto next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpISub, TypeU32(state), next, budget, step);
+	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, next);
+}
+
+// `condition` with the exit forced once the budget is spent: `exit_on_true` says which side leaves.
+uint32_t ForceLoopExit(EmitterState& state, uint32_t condition, bool exit_on_true) {
+	const auto exhausted = LoopBudgetExhausted(state);
+	auto       forced    = exhausted;
+	if (!exit_on_true) {
+		forced = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), forced, exhausted);
+	}
+	const auto combined = state.builder.AllocateId();
+	state.builder.AddFunction(exit_on_true ? spv::OpLogicalOr : spv::OpLogicalAnd, TypeBool(state),
+	                          combined, condition, forced);
+	return combined;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
+	const bool  loop_cap   = ctx.state.loop_budget_variable != 0;
+	if (loop_cap && term.loop_header) {
+		DecrementLoopBudget(ctx.state);
+	}
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
 			const auto* merge = term.merge_block;
@@ -130,7 +177,15 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			if (loop_cap) {
+				// A branch with exactly one side on a loop's merge block is that loop's break.
+				const bool true_breaks  = IsLoopMergeBlock(ctx.state.program, true_block);
+				const bool false_breaks = IsLoopMergeBlock(ctx.state.program, false_block);
+				if (true_breaks != false_breaks) {
+					condition = ForceLoopExit(ctx.state, condition, true_breaks);
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -150,19 +205,48 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 	}
 }
 
+// KYTY_LOOP_CAP in dispatcher form. A target "loops" when it is a back-edge (block id not after
+// the current one) or a latch block that branches straight back.
+bool DispatcherTargetLoops(const IR::Block* from, const IR::Block* target) {
+	if (target == nullptr) {
+		return false;
+	}
+	if (target->id <= from->id) {
+		return true;
+	}
+	return target->terminator.kind == CFG::TerminatorKind::Branch &&
+	       target->terminator.true_block != nullptr &&
+	       target->terminator.true_block->id <= target->id;
+}
+
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block) {
-	const auto& term = block->terminator;
+	const auto& term     = block->terminator;
+	const bool  loop_cap = ctx.state.loop_budget_variable != 0;
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
+			if (loop_cap && term.true_block->id <= block->id) {
+				DecrementLoopBudget(ctx.state);
+			}
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			return ConstantU32(ctx.state, term.true_block->id);
 		case CFG::TerminatorKind::ConditionalBranch: {
 			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
+			auto condition = ctx.Def(block->condition);
+			if (loop_cap) {
+				const bool true_loops  = DispatcherTargetLoops(block, term.true_block);
+				const bool false_loops = DispatcherTargetLoops(block, term.false_block);
+				if (true_loops != false_loops) {
+					if (term.true_block->id <= block->id || term.false_block->id <= block->id) {
+						DecrementLoopBudget(ctx.state);
+					}
+					// The side that does not loop is the exit.
+					condition = ForceLoopExit(ctx.state, condition, false_loops);
+				}
+			}
 			const auto selected = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected,
-			                              ctx.Def(block->condition),
+			ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected, condition,
 			                              ConstantU32(ctx.state, term.true_block->id),
 			                              ConstantU32(ctx.state, term.false_block->id));
 			return selected;
@@ -727,6 +811,20 @@ void EmitProgram(EmitterState& state) {
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
+	}
+	// Only a program that can loop pays for the budget: the dispatcher form is one loop, the
+	// structured form loops where a block is a loop header.
+	if (LoopCap() != 0 &&
+	    (dispatcher.has_value() ||
+	     std::ranges::any_of(state.program.blocks, [](const IR::Block* block) {
+		     return block->terminator.loop_header;
+	     }))) {
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable,
+		                          ConstantU32(state, LoopCap()));
 	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();

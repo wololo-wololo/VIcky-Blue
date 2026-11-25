@@ -155,6 +155,8 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// KYTY_LOOP_CAP: the remaining loop passes of the invocation (Function u32), 0 when disabled.
+	uint32_t                   loop_budget_variable                  = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;

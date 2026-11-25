@@ -28,6 +28,11 @@ struct Profile {
 
 inline constexpr Profile DefaultProfile {};
 
+// Debug aid: KYTY_LOOP_CAP=<n> gives every shader invocation a budget of n loop passes. Once it
+// is spent each loop exits, so a runaway data-dependent loop ends instead of timing out the host
+// GPU. 0 (unset) emits no cap. Read once; part of the shader store header.
+[[nodiscard]] uint32_t LoopCap();
+
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   IR::PushData::Window push_data       = {},
