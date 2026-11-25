@@ -205,6 +205,52 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
+BranchPhi ResolveBranchPhi(Value value) {
+	const auto* phi = value.Resolve().TryInstruction();
+	if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() != 2u ||
+	    phi->NumPhiBlocks() != 2u) {
+		return {};
+	}
+	const auto* merge = phi->Parent();
+	if (merge == nullptr || merge->terminator.loop_header) {
+		return {};
+	}
+	// The branching block an incoming edge comes from: the predecessor itself, or the block it
+	// alone follows when it only falls through to the merge.
+	const auto head_of = [&](const Block* predecessor) -> const Block* {
+		const auto& terminator = predecessor->terminator;
+		if (terminator.kind == CFG::TerminatorKind::ConditionalBranch) return predecessor;
+		if (terminator.kind != CFG::TerminatorKind::Branch || terminator.true_block != merge ||
+		    predecessor->ImmPredecessors().size() != 1u) {
+			return nullptr;
+		}
+		return predecessor->ImmPredecessors().front();
+	};
+	const std::array<const Block*, 2> predecessors {phi->PhiBlock(0), phi->PhiBlock(1)};
+	if (predecessors[0] == nullptr || predecessors[1] == nullptr || predecessors[0] == predecessors[1]) {
+		return {};
+	}
+	const auto* head = head_of(predecessors[0]);
+	if (head == nullptr || head != head_of(predecessors[1]) ||
+	    head->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+	    head->terminator.true_block == head->terminator.false_block || head->condition.IsEmpty()) {
+		return {};
+	}
+	// Each successor of the head reaches the merge through exactly one of the two predecessors.
+	const auto incoming = [&](const Block* successor) -> uint32_t {
+		const auto* through = successor == merge ? head : successor;
+		if (through == predecessors[0]) return 0u;
+		if (through == predecessors[1]) return 1u;
+		return 2u;
+	};
+	const auto if_true  = incoming(head->terminator.true_block);
+	const auto if_false = incoming(head->terminator.false_block);
+	if (if_true > 1u || if_false > 1u || if_true == if_false) {
+		return {};
+	}
+	return {head->condition, phi->Arg(if_true), phi->Arg(if_false)};
+}
+
 Value ResolveActiveU32(Value value, Value active) {
 	for (uint32_t depth = 0; depth <= 32; ++depth) {
 		value = value.Resolve();

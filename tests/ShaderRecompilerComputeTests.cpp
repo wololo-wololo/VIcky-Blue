@@ -37899,6 +37899,30 @@ TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_UBYTE);
 }
 
+TestCase BufferDescriptorBranchPhi(bool taken);
+
+void CheckBufferDescriptorBranchPhi(VulkanHarness &vulkan) {
+  for (const bool taken : {true, false}) {
+    auto test = BufferDescriptorBranchPhi(taken);
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "host-evaluated V# base",
+            compiled.resources.buffers.size() == 1u &&
+                compiled.resources.buffers[0].dwords[0] == (taken ? 8u : 0u),
+            "the branch-selected descriptor was not evaluated along the taken path");
+    for (const auto &value : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+      test.storage_buffer_ranges.emplace_back(descriptor.Base48(), u32(descriptor.GetSize()));
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "store through the branch-selected descriptor", test.expected,
+                 vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+}
+
 void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   for (const u32 wave : {32u, 64u}) {
@@ -39639,6 +39663,41 @@ TestCase TBufferLoadFormatXy1616IntegerComponents() {
           {0x00007fffu, 0x00008001u, 0xffff8000u, 0x00007fffu},
           {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XY, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+// A V# whose base stays at its initial value unless a uniform flag is set: the host follows the
+// branch, so the store reaches the buffer the taken path names.
+TestCase BufferDescriptorBranchPhi(bool taken) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(12, InlineU32(0)));
+  code.push_back(EncodeSMovB32(13, InlineU32(0)));
+  code.push_back(EncodeSMovB32(14, 2));
+  code.push_back(EncodeSMovB32(15, 3));
+  code.push_back(EncodeSopc(0x07, 4, InlineU32(0)));
+  code.push_back(EncodeSopp(0x04, 2));
+  code.push_back(EncodeSMovB32(12, 0));
+  code.push_back(EncodeSMovB32(13, 1));
+  AppendVMovLiteral(&code, 1, 0x1234abcdu);
+  AppendVMovU32(&code, 2, 4);
+  code.push_back(EncodeMubuf0(0x1c, 0, false, true));
+  code.push_back(EncodeMubuf1(1, 3, 2));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = taken ? "BufferDescriptorBranchPhiTaken" : "BufferDescriptorBranchPhiSkipped";
+  test.code = std::move(code);
+  test.initial = {1, 2, 3, 4, 5, 6, 7, 8};
+  test.expected = test.initial;
+  test.expected[taken ? 3 : 1] = 0x1234abcdu;
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_LG_U32, O::S_CBRANCH_SCC0, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(0, 16);
+  test.user_data[0] = 8;
+  test.user_data[4] = taken ? 1u : 0u;
+  test.has_user_data = true;
+  return test;
 }
 
 TestCase TBufferStoreFormatXy1616IntegerComponents() {
@@ -58569,6 +58628,7 @@ int main(int argc, char **argv) {
     CheckGpuSelectedFormattedRecordStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
     CheckSharedIndirectBufferLoads(vulkan);
+    CheckBufferDescriptorBranchPhi(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
@@ -59446,6 +59506,7 @@ int main(int argc, char **argv) {
   CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);
+  CheckBufferDescriptorBranchPhi(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);
   CheckPointerImageTable(vulkan);
