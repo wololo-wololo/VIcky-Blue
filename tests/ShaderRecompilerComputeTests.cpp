@@ -37681,6 +37681,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
   const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
   const bool byte = load == O::BUFFER_LOAD_UBYTE;
+  // A typed load names 16_16 UInt itself; the selected descriptor only supplies the range.
+  const bool typed = load == O::TBUFFER_LOAD_FORMAT_XY;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -37692,7 +37694,18 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     bool unmapped = false;
   };
   std::vector<DescriptorCase> cases;
-  if (formatted) {
+  if (typed) {
+    // Each result packs X into the low and Y into the high half.
+    cases = {
+        {F::k32UInt, 4, 4, 2, 0, 1, 0, 0, false, 0x8001ff00},
+        {F::k8UInt, 4, 0, 16, 3, 0, 4, 0, false, 0x8001ff00},
+        {F::k8UInt, 4, 0, 16, 3, 0, 2, 0, false, 0x80ff7f01},
+        {F::k32_32_32_32Float, 7, 16, 1, 0, 0, 8, 0, false, 0x40003c00},
+        {F::k32UInt, 4, 4, 1, 0, 1, 0, 0, false, 0, false, true},
+        {F::k8UInt, 4, 0, 4, 3, 0, 4, 0, false, 0, false, true},
+        {F::kInvalid, 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+    };
+  } else if (formatted) {
     cases = {
       {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
       {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
@@ -37783,7 +37796,9 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     }
   }
   TestCase test;
-  test.name = formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
+  test.name = typed ? (wave == 32 ? "TBufferLoadFormatXyGpuSelectedDescriptors32"
+                                  : "TBufferLoadFormatXyGpuSelectedDescriptors64")
+              : formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
                                       : "BufferLoadFormatXGpuSelectedDescriptors64")
                         : byte ? (wave == 32 ? "BufferLoadUbyteGpuSelectedDescriptors32"
                                               : "BufferLoadUbyteGpuSelectedDescriptors64")
@@ -37826,8 +37841,15 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   code.push_back(EncodeSmem1(descriptor_base, 20));
   code.push_back(EncodeVop1(0x01, 21, 12));
   code.push_back(EncodeVop1(0x01, 22, 13));
-  code.push_back(EncodeMubuf0(formatted ? 0x00 : byte ? 0x08 : 0x0a, 0, true, true, !formatted));
-  code.push_back(EncodeMubuf1(4, 2, 21, 14));
+  if (typed) {
+    code.push_back(EncodeMtbuf0(0x01, 11, 1, 0, true, true));
+    code.push_back(EncodeMtbuf1(0x01, 4, 2, 21, 14));
+    code.push_back(EncodeVop2(0x1a, 5, InlineU32(16), 5));
+    code.push_back(EncodeVop2(0x1c, 4, Vgpr(4), 5));
+  } else {
+    code.push_back(EncodeMubuf0(formatted ? 0x00 : byte ? 0x08 : 0x0a, 0, true, true, !formatted));
+    code.push_back(EncodeMubuf1(4, 2, 21, 14));
+  }
   AppendBufferStoreDword(&code, 4, 30);
   code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
   code.push_back(EncodeSopc(0x0a, 28, 29));
@@ -37839,7 +37861,9 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         typed ? "load_indirect_buffer_32x2_typed_11_1"
+                               : formatted ? "OpSwitch" : "Volatile"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -37847,6 +37871,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
                   O::S_BUFFER_LOAD_DWORDX8, load,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
                   O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  if (typed) test.opcodes.insert(std::ranges::find(test.opcodes, load) + 1, O::V_OR_B32);
   return test;
 }
 
@@ -37880,6 +37905,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
     for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
                             BufferLoadsGpuSelectedDescriptors(1u, wave, true),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::TBUFFER_LOAD_FORMAT_XY),
                             BufferLoadsGpuSelectedDescriptors(3u, wave),
                             BufferLoadsGpuSelectedDescriptors(4u, wave),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
@@ -37895,7 +37921,9 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           if (memory.kind != ResourceKind::IndirectBuffer) continue;
           const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
                             std::to_string(components) + (memory.coherent ? "_coherent" : "") +
-                            (memory.formatted ? "_formatted" : "");
+                            (memory.typed ? "_typed_" + std::to_string(memory.data_format) + "_" +
+                                                std::to_string(memory.number_format)
+                                          : memory.formatted ? "_formatted" : "");
           auto &profile = profiles[name];
           profile.components = components;
           ++profile.uses;
@@ -58007,6 +58035,11 @@ static int ReplayCapturedShaders(const char *folder) {
       passed++;
     } catch (const ShaderRecompiler::IR::UnsupportedComputeShader &) {
       failed++;
+      // The disassembly lands next to the capture, for reading around the failing pc.
+      auto listing = entry.path();
+      listing.replace_extension(".asm.txt");
+      std::ofstream(listing) << ShaderRecompiler::Decoder::ProgramToString(
+          ShaderRecompiler::PrepareShaderSource(shader.code, options).decoded);
     }
   }
   std::printf("replay: passed=%u failed=%u needs_runtime_calls=%u skipped=%u\n",

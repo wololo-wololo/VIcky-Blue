@@ -1131,6 +1131,8 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+std::array<uint32_t, 4> IndirectBufferLoadKey(const IR::MemoryInfo& memory, uint32_t components);
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1139,7 +1141,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    ConstantU32CompositeZero(state, components), [&]() {
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 			    const auto function = state.indirect_buffer_load_functions.at(
-			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+			        IndirectBufferLoadKey(mem, components));
 			    const auto args = IndirectBufferArgs(ctx, inst);
 			    const auto result = state.builder.AllocateId();
 			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
@@ -1225,6 +1227,69 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			                });
 		}
 	});
+}
+
+// A typed load reads the format its instruction names, whatever the selected descriptor holds.
+uint32_t LoadIndirectTyped(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                           const Format::BufferFormatInfo& info, uint32_t components) {
+	auto& state = ctx.state;
+	const auto source = [&](uint32_t component) {
+		return component < info.component_count
+		           ? FormattedSource {FormattedSourceKind::Memory, component}
+		           : FormattedSource {};
+	};
+	std::array<uint32_t, 4> out_of_bounds {};
+	for (uint32_t component = 0; component < components; ++component) {
+		out_of_bounds[component] = FormattedConstant(ctx, info, source(component).kind);
+	}
+	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                         ConstantU64(state, ~uint64_t {std::min(4u, info.byte_size) - 1u}));
+	const auto address = [&](uint32_t component) {
+		const auto offset = Format::GetFormatComponentByteOffset(info, component);
+		return offset == 0u ? base
+		                    : Binary(state, spv::OpIAdd, TypeU64(state), base,
+		                             ConstantU64(state, offset));
+	};
+	const auto load_word = [&](uint32_t component) {
+		return LoadBdaDword(ctx, Binary(state, spv::OpBitwiseAnd, TypeU64(state),
+		                                address(component), ConstantU64(state, ~uint64_t {3})));
+	};
+	// As for raw loads, a descriptor without a format reads nothing.
+	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+	                                 ConstantU32(state, 0));
+	return EmitValueOrDefaultIfCondition(
+	    state, AndCondition(state, valid_format,
+	                        IndirectBufferInBounds(state, buffer, 0u,
+	                                               ConstantU32(state, info.byte_size), true)),
+	    TypeU32Composite(state, components),
+	    ConstructU32Composite(state, components, out_of_bounds), [&]() {
+		    std::array<uint32_t, 4> values {};
+		    for (uint32_t component = 0; component < components; ++component) {
+			    values[component] = LoadFormattedComponent(
+			        ctx, info, source(component), load_word,
+			        [&](uint32_t selected, uint32_t bits) {
+				        // Component spacing keeps a narrow component within one DWORD.
+				        const auto byte = Binary(
+				            state, spv::OpBitwiseAnd, TypeU32(state),
+				            Unary(state, spv::OpUConvert, TypeU32(state), address(selected)),
+				            ConstantU32(state, 3));
+				        const auto shifted = Binary(
+				            state, spv::OpShiftRightLogical, TypeU32(state), load_word(selected),
+				            Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
+				                   ConstantU32(state, 3)));
+				        return Binary(state, spv::OpBitwiseAnd, TypeU32(state), shifted,
+				                      ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+			        });
+		    }
+		    return ConstructU32Composite(state, components, values);
+	    });
+}
+
+// One load function per distinct layout; a typed load also keys on its instruction format.
+std::array<uint32_t, 4> IndirectBufferLoadKey(const IR::MemoryInfo& memory, uint32_t components) {
+	uint32_t layout = uint32_t(memory.formatted);
+	if (memory.typed) layout |= 2u | (memory.data_format << 8u) | (memory.number_format << 16u);
+	return {memory.data_bits, components, uint32_t(memory.coherent), layout};
 }
 
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
@@ -1319,10 +1384,16 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			if (memory.kind != IR::ResourceKind::IndirectBuffer ||
 			    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) continue;
 			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(
-			    std::array {memory.data_bits, components, uint32_t(memory.coherent),
-			                uint32_t(memory.formatted)}, 0u);
+			    IndirectBufferLoadKey(memory, components), 0u);
 			if (!inserted) continue;
-			if (memory.formatted && state.indirect_format_function == 0u) {
+			const auto typed_info = Format::GetFormatInfo(
+			    memory.typed ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)
+			                 : Prospero::BufferFormat::kInvalid);
+			if (memory.typed && typed_info.type == Format::ComponentType::Unknown) {
+				EXIT("indirect typed buffer load has unsupported format dfmt=%u nfmt=%u\n",
+				     memory.data_format, memory.number_format);
+			}
+			if (memory.formatted && !memory.typed && state.indirect_format_function == 0u) {
 				DefineIndirectBufferFormats(ctx);
 			}
 			const auto function = entry->second = state.builder.AllocateId();
@@ -1332,7 +1403,9 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			    spv::OpTypeFunction, result_type, type, type, type, type, type, type, type, type);
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "") +
-			                  (memory.formatted ? "_formatted" : "");
+			                  (memory.typed ? "_typed_" + std::to_string(memory.data_format) + "_" +
+			                                      std::to_string(memory.number_format)
+			                                : memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
 			                          spv::FunctionControlMaskNone, signature);
@@ -1343,7 +1416,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
+			const auto result = memory.typed ? LoadIndirectTyped(ctx, buffer, typed_info, components)
+			    : memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
