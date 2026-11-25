@@ -150,6 +150,28 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 	file.Write(words.data(), words.size_bytes());
 }
 
+// Debug aid: KYTY_PIPELINE_TRACE=<folder> saves every compiled module's SPIR-V there and logs
+// the start and duration of each compute pipeline creation, to find a module the host driver
+// compiles slowly or never finishes.
+const std::filesystem::path& PipelineTraceFolder() {
+	static const std::filesystem::path folder = [] {
+		const char* text = std::getenv("KYTY_PIPELINE_TRACE");
+		return text == nullptr ? std::filesystem::path {} : std::filesystem::path {text};
+	}();
+	return folder;
+}
+
+void TraceModule(std::span<const uint32_t> spirv, const char* stage, uint64_t hash, uint64_t id) {
+	const auto& folder = PipelineTraceFolder();
+	if (folder.empty()) return;
+	std::error_code error;
+	std::filesystem::create_directories(folder, error);
+	std::ofstream file(folder / fmt::format("{}_{:016x}_{:016x}.spv", stage, hash, id),
+	                   std::ios::binary);
+	file.write(reinterpret_cast<const char*>(spirv.data()),
+	           static_cast<std::streamsize>(spirv.size_bytes()));
+}
+
 void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
@@ -272,6 +294,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
+	TraceModule(result.spirv, stage, key.hash, id);
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
@@ -1088,7 +1111,22 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const bool trace = !PipelineTraceFolder().empty();
+		const auto start = std::chrono::steady_clock::now();
+		if (trace) {
+			std::fprintf(stderr, "pipeline trace: begin compute module=%016llx\n",
+			             static_cast<unsigned long long>(module.id));
+			std::fflush(stderr);
+		}
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		if (trace) {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			    std::chrono::steady_clock::now() - start);
+			std::fprintf(stderr, "pipeline trace: end compute module=%016llx ms=%lld\n",
+			             static_cast<unsigned long long>(module.id),
+			             static_cast<long long>(elapsed.count()));
+			std::fflush(stderr);
+		}
 	}
 	CheckpointDriverCache();
 
