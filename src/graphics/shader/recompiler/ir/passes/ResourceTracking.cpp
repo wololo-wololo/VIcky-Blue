@@ -25,6 +25,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+bool g_strict_sampler_tracking = false;
+
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
@@ -645,7 +647,7 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		if (m_program.stage == ShaderType::Compute) {
 			std::printf("%s\n", message.c_str());
-			throw UnsupportedComputeShader {};
+			throw UnsupportedComputeShader(message);
 		}
 		EXIT("%s", message.c_str());
 		std::abort();
@@ -4179,7 +4181,7 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			if (sampler) {
+			if (sampler && !g_strict_sampler_tracking) {
 				// A sampler whose state cannot be traced statically falls back to the default
 				// (all-zero) sampler so the shader still compiles; filtering may be wrong.
 				std::printf("shader resource tracking: hash=0x%016llx pc=0x%08x untraceable sampler, "
@@ -4193,7 +4195,7 @@ private:
 					if (entry.handle == handle && entry.pc == pc) entry.source = descriptor;
 				}
 			}
-			if (!sampler || !ValidateSource(descriptor, bad_dword)) {
+			if (!sampler || g_strict_sampler_tracking || !ValidateSource(descriptor, bad_dword)) {
 				Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 				                     ValueOpcodeName(expected), bad_dword));
 			}
@@ -4617,6 +4619,10 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 }
 
 } // namespace
+
+void SetStrictSamplerTracking(bool strict) {
+	g_strict_sampler_tracking = strict;
+}
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
                     ShaderStageInputInfo input) {

@@ -9479,6 +9479,8 @@ void TestMalformedMemoryKindsRejected() {
 } // namespace
 
 int main() {
+  // The fork's default-sampler fallback would hide the rejections these tests check.
+  SetStrictSamplerTracking(true);
   try {
     const auto Run = [](const char *name, auto test) {
       try {
