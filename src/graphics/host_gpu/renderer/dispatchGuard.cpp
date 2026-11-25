@@ -46,10 +46,10 @@ bool DispatchArgsGuard::Enabled() {
 
 DispatchArgsGuard::DispatchArgsGuard(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics) {
-	m_ring  = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-	                                   SlotBytes * SlotCount);
-	m_trips = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags,
-	                                   TripBytes);
+	m_ring = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+	                                  SlotBytes * SlotCount);
+	m_trips =
+	    std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, TripBytes);
 	std::memset(m_trips->Mapped().data(), 0, m_trips->Mapped().size());
 	m_trips->Flush(0, m_trips->Size());
 
@@ -103,7 +103,7 @@ void DispatchArgsGuard::Report() {
 	if (!m_trips->IsCoherent()) {
 		m_trips->Invalidate(0, m_trips->Size());
 	}
-	const auto* base = m_trips->Mapped().data();
+	const auto* base  = m_trips->Mapped().data();
 	uint32_t    count = 0;
 	std::memcpy(&count, base, sizeof(count));
 	if (count == m_reported_trips) {
@@ -139,7 +139,7 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
 	// writers of the counts before this read; the guard ends with the same barrier.
 	const std::array buffers {
 	    vk::DescriptorBufferInfo {args.Handle(), source_base,
-	                              offset - source_base + sizeof(vk::DispatchIndirectCommand)},
+		                          offset - source_base + sizeof(vk::DispatchIndirectCommand)},
 	    vk::DescriptorBufferInfo {m_ring->Handle(), 0, VK_WHOLE_SIZE},
 	    vk::DescriptorBufferInfo {m_trips->Handle(), 0, VK_WHOLE_SIZE}};
 	std::array<vk::WriteDescriptorSet, 3> writes {};

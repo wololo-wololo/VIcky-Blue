@@ -41,9 +41,9 @@ private:
 	std::unique_ptr<Buffer> m_ring;
 	// Host-visible: the number of zeroed dispatches and what the last 16 held.
 	std::unique_ptr<Buffer> m_trips;
-	uint32_t                m_reported_trips = 0;
-	uint64_t                m_next           = 0;
-	uint32_t                m_max_groups     = 1u << 22u;
+	uint32_t                m_reported_trips    = 0;
+	uint64_t                m_next              = 0;
+	uint32_t                m_max_groups        = 1u << 22u;
 	vk::DescriptorSetLayout m_descriptor_layout = nullptr;
 	vk::PipelineLayout      m_layout            = nullptr;
 	vk::Pipeline            m_pipeline          = nullptr;
