@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -224,6 +226,8 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	// Created by the first guarded indirect dispatch.
+	std::unique_ptr<DispatchArgsGuard>    m_dispatch_guard;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 

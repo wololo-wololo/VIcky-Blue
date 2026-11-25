@@ -1,0 +1,49 @@
+#version 460
+// Copies the group counts of one indirect dispatch, zeroing all three when one exceeds the device
+// limit or their product exceeds max_groups. Such counts never finish, or run for seconds, and
+// the driver then resets the device.
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint words[]; } source;
+layout(set = 0, binding = 1, std430) buffer Destination { uint words[]; } destination;
+// Read by the CPU for its report (dispatchGuard.cpp): the raw counts and argument address of
+// the last 16 zeroed dispatches.
+layout(set = 0, binding = 2, std430) buffer Trips {
+	uint  count;
+	uint  pad[3];
+	uvec4 values[16];
+	uvec4 addresses[16];
+} trips;
+
+layout(push_constant, std430) uniform Params {
+	uint source_word;
+	uint destination_word;
+	uint max_x;
+	uint max_y;
+	uint max_z;
+	uint max_groups;
+	uint address_low;
+	uint address_high;
+} p;
+
+void main() {
+	const uint x = source.words[p.source_word];
+	const uint y = source.words[p.source_word + 1u];
+	const uint z = source.words[p.source_word + 2u];
+	uint xy_high;
+	uint xy_low;
+	umulExtended(x, y, xy_high, xy_low);
+	uint xyz_high;
+	uint xyz_low;
+	umulExtended(xy_low, z, xyz_high, xyz_low);
+	const bool bad = x > p.max_x || y > p.max_y || z > p.max_z || xy_high != 0u ||
+	                 xyz_high != 0u || xyz_low > p.max_groups;
+	if (bad) {
+		const uint index = atomicAdd(trips.count, 1u) % 16u;
+		trips.values[index]    = uvec4(x, y, z, 0u);
+		trips.addresses[index] = uvec4(p.address_low, p.address_high, 0u, 0u);
+	}
+	destination.words[p.destination_word]      = bad ? 0u : x;
+	destination.words[p.destination_word + 1u] = bad ? 0u : y;
+	destination.words[p.destination_word + 2u] = bad ? 0u : z;
+}
