@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ShaderCapture.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -375,6 +376,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 	} catch (const ShaderRecompiler::IR::UnsupportedComputeShader&) {
+		ShaderRecompiler::Capture::Save("tracking", params.code, options);
 		PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
 		                 "reason=resource tracking failed; rendering is incomplete",
 		                 params.hash);

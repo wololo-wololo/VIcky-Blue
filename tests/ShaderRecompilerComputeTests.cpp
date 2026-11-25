@@ -49,6 +49,8 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderCapture.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -57962,6 +57964,56 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+// Translates every shader captured with KYTY_SHADER_CAPTURE (see ShaderCapture.h) and reports
+// which ones the recompiler still rejects. Shaders with GPU-selected calls need the guest memory
+// of the original run and are only counted.
+static int ReplayCapturedShaders(const char *folder) {
+  using namespace Libs::Graphics;
+  namespace fs = std::filesystem;
+  uint32_t passed = 0, failed = 0, calls = 0, skipped = 0;
+  std::error_code error;
+  for (const auto &entry : fs::recursive_directory_iterator(folder, error)) {
+    if (!entry.is_regular_file() || entry.path().extension() != ".kshc") {
+      continue;
+    }
+    ShaderRecompiler::Capture::Shader shader;
+    if (!ShaderRecompiler::Capture::Load(entry.path(), shader)) {
+      std::printf("replay: unreadable %s\n", entry.path().string().c_str());
+      skipped++;
+      continue;
+    }
+    if (!shader.has_compute) {
+      // Only compute captures carry their stage input.
+      skipped++;
+      continue;
+    }
+    ShaderRecompiler::CompileOptions options;
+    options.stage = static_cast<ShaderType>(shader.header.stage);
+    options.wave_size = shader.header.wave_size;
+    options.user_data_base = shader.header.user_data_base;
+    options.shader_hash = shader.header.hash;
+    options.dump_ir = false;
+    options.user_data = shader.user_data;
+    options.back_code = shader.back_code;
+    options.input_info.compute = &shader.compute;
+    try {
+      const auto source =
+          ShaderRecompiler::PrepareShaderSource(shader.code, options);
+      if (source.unsupported_call_pc != UINT32_MAX || !source.calls.empty()) {
+        calls++;
+        continue;
+      }
+      (void)ShaderRecompiler::TranslateProgram(source.decoded, options);
+      passed++;
+    } catch (const ShaderRecompiler::IR::UnsupportedComputeShader &) {
+      failed++;
+    }
+  }
+  std::printf("replay: passed=%u failed=%u needs_runtime_calls=%u skipped=%u\n",
+              passed, failed, calls, skipped);
+  return failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -59250,6 +59302,9 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageStoreYzwxUsesInverseSwizzle());
     return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--replay") == 0) {
+    return ReplayCapturedShaders(argv[2]);
   }
   if (argc == 3 && std::strcmp(argv[1], "--image-view-death") == 0) {
     RunImageViewDeathCase(argv[2]);
