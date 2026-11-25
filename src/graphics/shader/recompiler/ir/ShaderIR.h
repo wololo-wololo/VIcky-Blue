@@ -102,6 +102,15 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
+	// Stores through a V# the shader reads at run time write through its device address: raw
+	// DWORDs, or a formatted X that the selected descriptor's format encodes.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		if (typed || data_bits != 32u) return false;
+		if (formatted) return opcode == ValueOpcode::StoreBufferU32;
+		return opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		       opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4;
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 

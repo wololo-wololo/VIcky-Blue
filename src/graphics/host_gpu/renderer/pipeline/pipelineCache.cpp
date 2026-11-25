@@ -304,6 +304,12 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
+// Debug aid: KYTY_SHADER_TRACE names shaders as they are translated, with timings.
+static bool ShaderTraceEnabled() {
+	static const bool enabled = std::getenv("KYTY_SHADER_TRACE") != nullptr;
+	return enabled;
+}
+
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               ShaderRecompiler::IR::PushData::Window& push_data) {
@@ -379,12 +385,30 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return nullptr;
 		}
 	}
+	// Debug aids: KYTY_SHADER_TRACE names every shader before it is translated, so the last line
+	// identifies one that hangs; KYTY_SHADER_CAPTURE_HASH=<hex> captures that shader regardless.
+	const bool trace = ShaderTraceEnabled();
+	const auto trace_start = std::chrono::steady_clock::now();
+	static const uint64_t capture_hash = [] {
+		const char* text = std::getenv("KYTY_SHADER_CAPTURE_HASH");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+	}();
+	if (trace) {
+		std::fprintf(stderr, "shader trace: translate 0x%016llx stage=%d\n",
+		             static_cast<unsigned long long>(params.hash), static_cast<int>(options.stage));
+		std::fflush(stderr);
+	}
+	if (capture_hash != 0 && capture_hash == params.hash) {
+		ShaderRecompiler::Capture::Save("requested", params.code, options);
+	}
 	auto* current = entry == m_program_cache.end() ? &source : entry->second.call_source.get();
+	options.gpu_table_descriptors =
+	    entry != m_program_cache.end() && entry->second.gpu_table_descriptors;
 	ShaderRecompiler::TranslateResult translated;
-	try {
+	const auto translate = [&](bool refresh) {
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
-				if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				if (refresh) ShaderRecompiler::RefreshShaderSource(*current, runtime);
 				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
 			} else {
@@ -393,6 +417,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+	};
+	try {
+		translate(entry == m_program_cache.end());
 	} catch (const ShaderRecompiler::IR::UnsupportedComputeShader&) {
 		ShaderRecompiler::Capture::Save("tracking", params.code, options);
 		PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
@@ -414,8 +441,31 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		if (!ShaderRecompiler::IR::MaterializeResources(
-		        program.resource_plan, runtime, program.resources, program.specialization)) {
+		bool materialized = ShaderRecompiler::IR::MaterializeResources(
+		    program.resource_plan, runtime, program.resources, program.specialization);
+		if (!materialized && program.call_source == nullptr) {
+			// A buffer descriptor table can hold more candidates than the host can enumerate and
+			// bind. Translate again with such descriptors left to the GPU, which reads the V# it
+			// selects and accesses memory through its device address.
+			options.gpu_table_descriptors = true;
+			try {
+				translate(false);
+				program.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				program.resources     = {};
+				program.specialization = {};
+				materialized = ShaderRecompiler::IR::MaterializeResources(
+				    program.resource_plan, runtime, program.resources, program.specialization);
+			} catch (const ShaderRecompiler::IR::UnsupportedComputeShader&) {
+				materialized = false;
+			}
+			program.gpu_table_descriptors = materialized;
+			if (materialized) {
+				PipelineCacheLog("shader=0x{:016x} stage={}: table-selected buffer descriptors are "
+				                 "read on the GPU",
+				                 params.hash, static_cast<int>(options.stage));
+			}
+		}
+		if (!materialized) {
 			// TEMPORARY WORKAROUND: a shader whose resources cannot be specialized is skipped
 			// like an unsupported callable target. A compute shader drops its dispatch; any
 			// other stage drops every draw that uses it (see GetGraphicsPrograms).
@@ -433,8 +483,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return bind(*module);
 		}
 	}
-	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data));
+	const auto& compiled =
+	    CompileModule(entry->second, entry->first, options, std::move(translated), push_data);
+	if (trace) {
+		std::fprintf(stderr, "shader trace: compiled 0x%016llx in %lld ms\n",
+		             static_cast<unsigned long long>(params.hash),
+		             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                 std::chrono::steady_clock::now() - trace_start).count()));
+		std::fflush(stderr);
+	}
+	return bind(compiled);
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -1089,7 +1147,14 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		const auto pipeline_start = std::chrono::steady_clock::now();
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		if (ShaderTraceEnabled()) {
+			std::fprintf(stderr, "shader trace: compute pipeline in %lld ms\n",
+			             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			                 std::chrono::steady_clock::now() - pipeline_start).count()));
+			std::fflush(stderr);
+		}
 	}
 	CheckpointDriverCache();
 

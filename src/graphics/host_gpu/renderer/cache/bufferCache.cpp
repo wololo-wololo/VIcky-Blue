@@ -718,6 +718,28 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
+	// The store went through the page table, so cache buffers back the range. Each takes the
+	// same path as a written binding: pending guest writes are uploaded first, then the range
+	// becomes GPU-modified and is downloaded when the guest next reads it.
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto first  = std::max(buffer.CpuAddress(), vaddr);
+		const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (first >= last) {
+			continue;
+		}
+		(void)SynchronizeBuffer(buffer, first, last - first, true, false);
+		m_gpu_modified_ranges.Add(first, last - first);
+		ForgetColorMetadataChecks(first, last - first);
+	}
+}
+
 void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);

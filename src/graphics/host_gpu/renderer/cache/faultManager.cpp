@@ -19,6 +19,9 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr size_t MaxPageFaults    = 1024;
+// The bitmap holds a fault bit per cache page, then a bit per page a shader stored to through its
+// device address (see StoreBda in the SPIR-V emitter).
+constexpr uint64_t FaultBitmapPages = BufferCache::CACHING_NUMPAGES * 2;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
 } // namespace
@@ -27,7 +30,7 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     FaultBitmapPages / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -110,7 +113,7 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation.
+	const auto num_threads    = FaultBitmapPages / 128; // Four words per invocation.
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
@@ -120,10 +123,18 @@ void FaultManager::ProcessFaultBuffer() {
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
+		RangeSet    written_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
 		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
 		for (uint32_t index = 1; index <= count; ++index) {
+			constexpr uint64_t written_base = BufferCache::CACHING_NUMPAGES
+			                                  << BufferCache::CACHING_PAGEBITS;
+			if (faults[index] >= written_base) {
+				written_ranges.Add(BufferCache::GuestAddress(faults[index] - written_base),
+				                   BufferCache::CACHING_PAGESIZE);
+				continue;
+			}
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
@@ -131,6 +142,10 @@ void FaultManager::ProcessFaultBuffer() {
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
+		});
+		// Stores through device addresses reach no binding: hand their pages to the cache now.
+		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.MarkGpuWritten(start, end - start);
 		});
 		m_fault_areas[area] = 0;
 	});

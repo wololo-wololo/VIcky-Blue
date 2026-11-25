@@ -1574,7 +1574,11 @@ struct TestCase {
   struct {
     uint64_t address = 0;
     std::vector<u32> words;
+    // Check the written-page half of the bitmap instead of the fault half.
+    bool written = false;
   } faults;
+  // Translate with table-selected buffer descriptors left to the GPU.
+  bool gpu_table_descriptors = false;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1911,6 +1915,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.profile = test.profile;
   options.dump_ir = true;
   options.emit_debug_info = true; // Checks find variables and functions by OpName.
+  options.gpu_table_descriptors = test.gpu_table_descriptors;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -21146,7 +21151,8 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
       const vk::BufferCopy region{
-          (BufferCache::PageIndex(test.faults.address) >> 5u) * sizeof(u32), 0,
+          ((BufferCache::PageIndex(test.faults.address) +
+            (test.faults.written ? BufferCache::CACHING_NUMPAGES : 0u)) >> 5u) * sizeof(u32), 0,
           fault_words * sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -25305,7 +25311,7 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage | vk::BufferUsageFlagBits::eTransferSrc);
+        shader_name, BufferCache::CACHING_NUMPAGES / 4, usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -45516,12 +45522,17 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
-  for (const bool wide : {false, true})
+  for (const auto [wide, gpu] : {std::pair{false, false}, std::pair{true, false}, std::pair{false, true}})
   for (const u32 wave : {32u, 64u}) {
     const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
     const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
     TestCase test;
-    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
+    test.name = wide ? "GpuSelectedFormattedRgba16Store"
+                : gpu ? "GpuReadFormattedRecordStore" : "GpuSelectedFormattedRecordStore";
+    // With the descriptor left to the GPU, the same store goes through the selected V#'s device
+    // address and reports the cache pages it wrote (rows 0..5 span the first two).
+    test.gpu_table_descriptors = gpu;
+    if (gpu) test.faults = {.address = 0u, .words = {3u}, .written = true};
     test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
     auto bytes = std::as_writable_bytes(std::span(test.initial));
     if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
@@ -45597,10 +45608,12 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
         {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
     test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
-    if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
-    test.forbidden_spirv = {"OpAtomicCompareExchange"};
+    if (!wide && !gpu) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
+    if (gpu) test.required_spirv.push_back("store_indirect_buffer_x1_formatted");
+    else test.forbidden_spirv = {"store_indirect_buffer_"};
+    test.forbidden_spirv.push_back("OpAtomicCompareExchange");
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    if (!wide) {
+    if (!wide && !gpu) {
       std::set<u32> nonuniform;
       u32 shared_stores = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
@@ -45625,7 +45638,8 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
         if (inst.GetOpcode() == ValueOpcode::LoadBufferU32)
           bda_loads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
         else
-          native_stores += memory.kind == ResourceKind::Buffer && memory.formatted;
+          native_stores += memory.kind == (gpu ? ResourceKind::IndirectBuffer : ResourceKind::Buffer) &&
+                           memory.formatted;
       }
     Require(test.name, "shared scalar descriptor reads", bda_loads == 1u && native_stores == 1u,
             "native store planning replaced the BDA read or bypassed formatted conversion");
@@ -58031,7 +58045,10 @@ static int ReplayCapturedShaders(const char *folder) {
         calls++;
         continue;
       }
-      (void)ShaderRecompiler::TranslateProgram(source.decoded, options);
+      const auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+      // The pipeline cache extracts the plan next; name the capture first, in case that hangs.
+      std::printf("replay: plan %s\n", entry.path().filename().string().c_str());
+      (void)ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
       passed++;
       // A capture that translates failed later, in specialization: list it on request.
       if (std::getenv("KYTY_REPLAY_LISTINGS") != nullptr) {
@@ -58134,6 +58151,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--formatted-record-store-only") == 0) {
+    VulkanHarness vulkan;
+    CheckGpuSelectedFormattedRecordStore(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--program-id-only") == 0) {

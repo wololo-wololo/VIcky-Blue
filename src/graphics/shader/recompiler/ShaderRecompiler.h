@@ -23,6 +23,8 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        emit_debug_info            = false;
+	// Leave table-selected buffer descriptors to the GPU instead of enumerating candidates.
+	bool                        gpu_table_descriptors      = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

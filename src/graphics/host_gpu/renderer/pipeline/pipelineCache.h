@@ -218,6 +218,9 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		// Set when candidate enumeration failed and the shader was translated again with
+		// table-selected buffer descriptors read on the GPU; later translations must match.
+		bool                                         gpu_table_descriptors = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);

@@ -410,8 +410,9 @@ private:
 class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-	        ShaderStageInputInfo input)
+	        ShaderStageInputInfo input, bool gpu_table_descriptors)
 	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg), m_input(input),
+	      m_gpu_table_descriptors(gpu_table_descriptors),
 	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
@@ -3601,6 +3602,15 @@ private:
 			const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
 			if (memory.idxen != indexed) return false;
 		}
+		// Asked for after a table proved too large to enumerate: leave the descriptor to the GPU,
+		// which reads the V# it selects and accesses memory through its device address.
+		if (m_gpu_table_descriptors &&
+		    std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    const auto  opcode = use.user->GetOpcode();
+			    const auto& memory = m_program.memory_info[use.user->Flags<MemoryFlags>().index];
+			    return memory.SupportsIndirectBufferStore(opcode) ||
+			           memory.SupportsIndirectBufferLoad(opcode);
+		    })) return false;
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
@@ -4427,6 +4437,12 @@ private:
 					return;
 				}
 				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
+				if (source == UINT32_MAX && memory.kind == ResourceKind::Buffer &&
+				    memory.SupportsIndirectBufferStore(op)) {
+					// The shader holds the V# itself: the store goes through its device address.
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					return;
+				}
 				if (source == UINT32_MAX) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
@@ -4541,6 +4557,7 @@ private:
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
 	ShaderStageInputInfo                       m_input;
+	bool                                       m_gpu_table_descriptors = false;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<ScalarReadStep>                m_srt_walk;
@@ -4619,8 +4636,8 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 } // namespace
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
+                    ShaderStageInputInfo input, bool gpu_table_descriptors) {
+	Tracker(program, decoded, native_cfg, input, gpu_table_descriptors).Run();
 	program.uniform_fill = RecognizePatternFill(program, decoded, input);
 }
 
