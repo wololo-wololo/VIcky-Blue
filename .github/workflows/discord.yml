@@ -1,0 +1,56 @@
+name: Discord
+
+# Announces new, closed and reopened issues in Discord. Does nothing until the repository
+# secret DISCORD_WEBHOOK_URL is set to a channel webhook.
+on:
+  issues:
+    types: [ opened, closed, reopened ]
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    name: Post to Discord
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts
+
+      - name: Post
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACTION: ${{ github.event.action }}
+          ISSUE: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          LABELS: ${{ join(github.event.issue.labels.*.name, ', ') }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set; skipping."
+            exit 0
+          fi
+          hint=""
+          case "$ACTION" in
+            opened)
+              lead="New problem to work on"
+              hint="Comment /claim on the issue to take it."
+              ;;
+            closed) lead="Done" ;;
+            reopened) lead="Back open" ;;
+          esac
+          message="$lead: #$ISSUE $ISSUE_TITLE"
+          if [ "$ACTION" = "opened" ] && [ -n "$LABELS" ]; then
+            message="$message [$LABELS]"
+          fi
+          # Never relay text that breaks the naming rule.
+          if ! printf '%s\n' "$message" | bash scripts/policy-check.sh text "Discord message"; then
+            message="$lead: issue #$ISSUE (title withheld: it breaks the naming rule)"
+          fi
+          jq -n --arg c "$message" --arg h "$hint" --arg u "$ISSUE_URL" \
+            '{content: ($c + (if $h != "" then "\n" + $h else "" end) + "\n<" + $u + ">"),
+              allowed_mentions: {parse: []}}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL" > /dev/null

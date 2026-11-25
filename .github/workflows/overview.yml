@@ -34,7 +34,7 @@ jobs:
           {
             echo "This is the list of what needs doing. It is rebuilt automatically whenever an issue changes."
             echo
-            echo "Pick anything without an assignee, comment on it to claim it, and work on its linked branch."
+            echo "Pick anything not marked as taken, comment \`/claim\` on it, and work on its linked branch. Comment \`/unclaim\` if you stop."
             echo "[CONTRIBUTING.md](https://github.com/$GH_REPO/blob/main/CONTRIBUTING.md#joining-in) has the details."
             echo "To hear about new problems as they are found, use **Watch → Custom → Issues** on the repository."
             echo

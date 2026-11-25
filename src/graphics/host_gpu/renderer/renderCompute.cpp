@@ -284,6 +284,20 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// Debug aid: with KYTY_GPU_FAULT_TRACE set, every compute dispatch is named on stderr and then
+// submitted and waited for, so the last line before a device loss names the dispatch at fault.
+static void TraceDispatch(RenderContext& context, uint64_t shader_hash, uint32_t x, uint32_t y,
+                          uint32_t z) {
+	static const bool enabled = std::getenv("KYTY_GPU_FAULT_TRACE") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	std::fprintf(stderr, "gpu fault trace: dispatch shader=0x%016llx groups=%u,%u,%u\n",
+	             static_cast<unsigned long long>(shader_hash), x, y, z);
+	std::fflush(stderr);
+	context.GetCommandScheduler().Finish();
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -487,7 +501,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	const auto traced_hash = program.shader_hash;
 	ResetBindings();
+	TraceDispatch(m_context, traced_hash, thread_group_x, thread_group_y, thread_group_z);
 }
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
@@ -543,7 +559,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	const auto traced_hash = program.shader_hash;
 	ResetBindings();
+	TraceDispatch(m_context, traced_hash, ~0u, ~0u, ~0u);
 }
 
 } // namespace Libs::Graphics

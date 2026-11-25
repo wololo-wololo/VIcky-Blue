@@ -111,6 +111,23 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Debug aid: KYTY_SKIP_SHADERS="<hex hash>[,<hex hash>...]" drops every dispatch or draw that uses
+// one of the listed shaders, to bisect a host GPU fault down to a single guest shader.
+bool DebugSkipShader(uint64_t hash) {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> result;
+		if (const char* text = std::getenv("KYTY_SKIP_SHADERS"); text != nullptr) {
+			char* end = nullptr;
+			for (const char* pos = text; *pos != 0; pos = *end == ',' ? end + 1 : end) {
+				result.push_back(std::strtoull(pos, &end, 16));
+				if (end == pos) break;
+			}
+		}
+		return result;
+	}();
+	return std::ranges::find(skipped, hash) != skipped.end();
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -323,6 +340,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	if (DebugSkipShader(params.hash)) return nullptr;
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -398,12 +416,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto& program = entry->second;
 		if (!ShaderRecompiler::IR::MaterializeResources(
 		        program.resource_plan, runtime, program.resources, program.specialization)) {
-			// A compute shader whose resources cannot be specialized is skipped like an
-			// unsupported callable target; any other stage still stops here.
-			EXIT_IF(options.stage != ShaderType::Compute);
-			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
+			// TEMPORARY WORKAROUND: a shader whose resources cannot be specialized is skipped
+			// like an unsupported callable target. A compute shader drops its dispatch; any
+			// other stage drops every draw that uses it (see GetGraphicsPrograms).
+			PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
 			                 "reason=resource specialization failed; rendering is incomplete",
-			                 params.hash);
+			                 options.stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW",
+			                 params.hash, static_cast<int>(options.stage));
 			program.skip_dispatch = true;
 			return nullptr;
 		}
@@ -818,7 +837,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	auto push_data = ShaderRecompiler::IR::PushData::GraphicsWindow(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data);
+		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data);
+		if (pixel_program == nullptr) {
+			// Skipped pixel program: a null first vertex module makes the caller drop the draw.
+			vertex_info[0].stage = {};
+			return;
+		}
+		const auto& pixel_module = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -828,7 +853,10 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data);
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data) == nullptr) {
+			vertex_info[0].stage = {};
+			return;
+		}
 	}
 }
 

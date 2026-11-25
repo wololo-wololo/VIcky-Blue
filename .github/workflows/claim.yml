@@ -1,0 +1,90 @@
+name: Claim
+
+# Lets anyone reserve an issue by commenting /claim, and release it with /unclaim.
+# The claimant becomes the assignee, which the overview issue and Discord then show.
+on:
+  issue_comment:
+    types: [ created ]
+
+permissions:
+  issues: write
+  actions: write
+  contents: read
+
+jobs:
+  claim:
+    name: Handle /claim and /unclaim
+    if: >-
+      !github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/claim') ||
+       startsWith(github.event.comment.body, '/unclaim'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts
+
+      - name: Update the assignee
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+          USER: ${{ github.event.comment.user.login }}
+          COMMENT: ${{ github.event.comment.body }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          command=$(printf '%s' "$COMMENT" | head -n 1 | tr -d '\r' | awk '{print $1}')
+          holders=$(gh issue view "$ISSUE" --json assignees --jq '[.assignees[].login] | join(", ")')
+          is_overview=$(gh issue view "$ISSUE" --json labels --jq '[.labels[].name] | index("overview") != null')
+          announce=""
+
+          if [ "$is_overview" = "true" ]; then
+            gh issue comment "$ISSUE" --body "@$USER this is the overview. Pick one of the issues listed in it and comment \`/claim\` there."
+            exit 0
+          fi
+
+          case "$command" in
+            /claim)
+              if [ "$ISSUE_STATE" != "open" ]; then
+                gh issue comment "$ISSUE" --body "@$USER this issue is closed, so there is nothing to claim."
+              elif [ -z "$holders" ]; then
+                gh issue edit "$ISSUE" --add-assignee "$USER"
+                gh issue comment "$ISSUE" --body "@$USER this one is yours. Push to the linked branch or open a draft pull request early, and comment \`/unclaim\` if you stop."
+                announce="claimed by"
+              elif printf '%s' ", $holders," | grep -qF ", $USER,"; then
+                gh issue comment "$ISSUE" --body "@$USER you already hold this issue."
+              else
+                gh issue comment "$ISSUE" --body "@$USER this is already taken by $holders. Offer to help here, or pick another issue from the overview."
+              fi
+              ;;
+            /unclaim)
+              if printf '%s' ", $holders," | grep -qF ", $USER,"; then
+                gh issue edit "$ISSUE" --remove-assignee "$USER"
+                gh issue comment "$ISSUE" --body "Released by @$USER. This issue is free to claim again."
+                announce="released by"
+              else
+                gh issue comment "$ISSUE" --body "@$USER you do not hold this issue."
+              fi
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+
+          # Assignments made by this workflow do not trigger other workflows, so refresh the
+          # overview explicitly.
+          gh workflow run overview.yml || true
+
+          if [ -n "$announce" ] && [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            message="Issue #$ISSUE $announce $USER: $ISSUE_TITLE"
+            if printf '%s\n' "$message" | bash scripts/policy-check.sh text "Discord message"; then
+              jq -n --arg c "$message" --arg u "$ISSUE_URL" \
+                '{content: ($c + "\n<" + $u + ">"), allowed_mentions: {parse: []}}' \
+                | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL" > /dev/null
+            fi
+          fi

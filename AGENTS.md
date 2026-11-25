@@ -40,3 +40,11 @@ After every test run of the target title, run `python scripts/triage-log.py <log
 the result: file new problems (`--file-issues`, or by hand for things the script cannot see),
 close issues the run shows are fixed, and update the README status if the title got further.
 When a new failure pattern shows up in logs, teach `scripts/triage-log.py` to recognise it.
+
+## Claims and Discord
+
+An issue is reserved by commenting `/claim` on it (`/unclaim` releases it); the claimant
+becomes the assignee. Before starting work on an issue, check that it is unassigned or
+assigned to the person you are working for, and claim it. New, closed, reopened and claimed
+issues are announced in Discord when the `DISCORD_WEBHOOK_URL` repository secret is set. The
+pinned Discord message lives in `docs/discord-start-here.md`.

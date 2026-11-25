@@ -45,8 +45,10 @@ must follow every other rule here. AI co-author trailers are fine.
    [`workaround-debt`](https://github.com/wololo-wololo/VIcky-Blue/labels/workaround-debt) issues replace a temporary hack with a real
    implementation, and [`good first issue`](https://github.com/wololo-wololo/VIcky-Blue/labels/good%20first%20issue) is the easy way
    in. Milestones show which goal an issue serves.
-2. **Say you are on it.** Comment on the issue so two people do not do the same work. If you
-   stop, say so.
+2. **Claim it.** Comment `/claim` on the issue. You become its assignee and the overview shows
+   it as taken, so two people do not do the same work. If it is already held, the bot says by
+   whom. Comment `/unclaim` when you stop; a claim with no activity for two weeks may be
+   released by a maintainer. A claim only counts on GitHub, not in chat.
 3. **Use the issue's branch.** Every issue has a linked branch named
    `<area>/<issue number>-<short-name>`, shown in the issue's Development sidebar.
    Collaborators push to it directly. Everyone else forks the repository, branches from
