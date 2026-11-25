@@ -58033,6 +58033,12 @@ static int ReplayCapturedShaders(const char *folder) {
       }
       (void)ShaderRecompiler::TranslateProgram(source.decoded, options);
       passed++;
+      // A capture that translates failed later, in specialization: list it on request.
+      if (std::getenv("KYTY_REPLAY_LISTINGS") != nullptr) {
+        auto listing = entry.path();
+        listing.replace_extension(".asm.txt");
+        std::ofstream(listing) << ShaderRecompiler::Decoder::ProgramToString(source.decoded);
+      }
     } catch (const ShaderRecompiler::IR::UnsupportedComputeShader &) {
       failed++;
       // The disassembly lands next to the capture, for reading around the failing pc.

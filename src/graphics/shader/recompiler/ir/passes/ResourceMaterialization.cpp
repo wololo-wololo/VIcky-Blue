@@ -730,8 +730,37 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
-			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
+			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes)) {
+				// Debug aid: with KYTY_INDIRECT_TABLE_STATS set, report what an oversized V# table
+				// holds (populated rows, address span, the first distinct shapes and bases).
+				if (pointer == nullptr && read_dwords == 4u && std::getenv("KYTY_INDIRECT_TABLE_STATS") != nullptr) {
+					uint64_t nonnull = 0, lowest = UINT64_MAX, highest = 0, first_row = UINT64_MAX, last_row = 0;
+					std::vector<std::array<uint32_t, 2>> shapes;
+					std::vector<uint64_t> bases;
+					for (uint64_t row = 0; row < count; ++row) {
+						std::array<uint32_t, 4> words {};
+						if (!ReadScalarTable(table_base, table_size, first + row * step, runtime, words)) break;
+						const auto base = (uint64_t {words[1] & 0xffffu} << 32u) | words[0];
+						if (base == 0u && words[2] == 0u) continue;
+						++nonnull;
+						first_row = std::min(first_row, row);
+						last_row = row;
+						const auto size = uint64_t {words[2]} * std::max(1u, (words[1] >> 16u) & 0x3fffu);
+						lowest = std::min(lowest, base);
+						highest = std::max(highest, base + size);
+						const std::array<uint32_t, 2> shape {words[1] >> 16u, words[3]};
+						if (shapes.size() < 16u && std::ranges::find(shapes, shape) == shapes.end()) shapes.push_back(shape);
+						if (bases.size() < 6u) bases.push_back(base), bases.push_back(words[2]);
+					}
+					std::string text;
+					for (const auto& shape: shapes) text += fmt::format(" {:08x}/{:08x}", shape[0], shape[1]);
+					for (size_t i = 0; i + 1 < bases.size(); i += 2) text += fmt::format(" [{:#x} n={}]", bases[i], bases[i + 1]);
+					SpecializationFail(fmt::format("table stats rows={} nonnull={} first_row={} last_row={} "
+					    "lowest={:#x} highest={:#x} shapes(word1hi/word3) and samples:{}",
+					    count, nonnull, first_row, last_row, lowest, highest, text));
+				}
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
+			}
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
 			auto& heap_words = program.material_keys;

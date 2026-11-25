@@ -419,6 +419,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			// TEMPORARY WORKAROUND: a shader whose resources cannot be specialized is skipped
 			// like an unsupported callable target. A compute shader drops its dispatch; any
 			// other stage drops every draw that uses it (see GetGraphicsPrograms).
+			ShaderRecompiler::Capture::Save("specialization", params.code, options);
 			PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
 			                 "reason=resource specialization failed; rendering is incomplete",
 			                 options.stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW",
