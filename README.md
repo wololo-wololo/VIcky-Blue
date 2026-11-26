@@ -52,7 +52,10 @@ Known state:
     `VK_ERROR_DEVICE_LOST` on its larger dispatches. Vulkan validation and GPU-assisted validation
     report nothing for it. `KYTY_GPU_FAULT_TRACE=1` is the trace that identified it
     ([#13](https://github.com/wololo-wololo/VIcky-Blue/issues/13)).
-  - `--shader-cache` keeps compiled shaders between boots.
+  - `--shader-cache` keeps compiled shaders between boots. A dump without `sce_sys/param.json`
+    has no title id and stores them under the name `UNKNOWN`
+    ([#27](https://github.com/wololo-wololo/VIcky-Blue/issues/27)). The first boot still compiles
+    everything; with a complete cache the warm-up before the first frame took 30 s.
 - Compute dispatches and, new, draws whose shader resources cannot be tracked or specialized are
   skipped by a temporary workaround, which is the main reason the image is incomplete
   ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2), [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3), [#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)). The failures seen are GPU-selected buffer
