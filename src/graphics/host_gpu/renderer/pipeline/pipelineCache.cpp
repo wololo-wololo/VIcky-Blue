@@ -93,7 +93,10 @@ std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
 	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
+		// A dump without sce_sys/param.json has no id. Its caches share one name, like its
+		// sandbox directories: the driver cache keys entries by content and the shader store
+		// is rebuilt when its header differs, so a second such title only costs reuse.
+		return "UNKNOWN";
 	}
 	if (!std::ranges::all_of(title_id, [](unsigned char c) {
 		    return std::isalnum(c) != 0 || c == '-' || c == '_';
