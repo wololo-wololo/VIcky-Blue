@@ -63,6 +63,10 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Experiment for the object pop-in (KYTY_SYNC_GPU_WRITES): hands the pages that shaders wrote
+	// through device addresses to the buffer cache now, and waits for the GPU, so the guest's next
+	// read of them downloads the written bytes.
+	void               PublishGpuWrites();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

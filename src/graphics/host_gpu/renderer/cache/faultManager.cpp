@@ -8,6 +8,8 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
+#include <cstdio>
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
@@ -127,6 +129,14 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
 		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
+		if (faults[0] > count) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1) < 16) {
+				std::fprintf(stderr, "fault buffer overflow: %llu page records, %llu kept\n",
+				             static_cast<unsigned long long>(faults[0]),
+				             static_cast<unsigned long long>(count));
+			}
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			constexpr uint64_t written_base = BufferCache::CACHING_NUMPAGES
 			                                  << BufferCache::CACHING_PAGEBITS;

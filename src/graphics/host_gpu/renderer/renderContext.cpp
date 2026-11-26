@@ -6,6 +6,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
 #include <algorithm>
 
 namespace Libs::Graphics {
@@ -162,6 +163,18 @@ void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
+}
+
+void RenderContext::PublishGpuWrites() {
+	static const bool enabled = std::getenv("KYTY_SYNC_GPU_WRITES") != nullptr;
+	if (!enabled || !m_fault_process_pending) {
+		return;
+	}
+	m_fault_process_pending = false;
+	m_buffer_cache.ProcessFaultBuffer();
+	// The written pages are marked by a deferred operation that runs once the GPU has scanned
+	// the fault bitmap.
+	m_command_scheduler.Finish();
 }
 
 void RenderContext::RunGarbageCollector() {

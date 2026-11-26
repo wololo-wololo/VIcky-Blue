@@ -945,6 +945,9 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		return;
 	}
 
+	// Experiment: pages written through device addresses become GPU-modified before the signal.
+	m_renderer.PublishGpuWrites();
+
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
