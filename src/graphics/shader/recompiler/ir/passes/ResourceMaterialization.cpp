@@ -1555,18 +1555,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (const auto found = cloned.find(source); found != cloned.end()) {
 			return Value(found->second);
 		}
-		if (const auto branch = ResolveBranchPhi(value);
-		    !branch.condition.IsEmpty() && ValidateRuntimeValue(program, value) &&
-		    (value.GetType() == Type::U1 || value.GetType() == Type::U32)) {
-			// The plan has no blocks, so a branch the host can follow becomes a select.
-			auto& target = plan.value_storage.emplace_back(
-			    value.GetType() == Type::U1 ? ValueOpcode::SelectU1 : ValueOpcode::SelectU32);
-			cloned.emplace(source, &target);
-			target.SetArg(0, Clone(branch.condition));
-			target.SetArg(1, Clone(branch.if_true));
-			target.SetArg(2, Clone(branch.if_false));
-			return Value(&target);
-		}
 		if (source->GetOpcode() == ValueOpcode::LoadBufferU32) plan.capture_specialization_reads = true;
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
