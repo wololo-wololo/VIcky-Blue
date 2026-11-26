@@ -34,6 +34,21 @@ Work is tracked as GitHub issues with milestones; see the "Joining in" section o
 issue. When you find a new blocker or add a temporary workaround, open an issue for it with
 the matching label, and create a linked branch with `gh issue develop`.
 
+## Test boots: press Cross once
+
+A boot of the target title stops at a first screen: almost empty and dark, with a small
+"CONTINUE" prompt in the bottom-right corner. It does not advance on its own, so a boot sitting
+there is neither loading nor hung.
+
+- Press Cross once on that screen (keyboard J in the default mapping). That advances to the intro.
+- After that everything comes automatically: the intro, the loading screen and the scenes that
+  follow. Do not press Cross again, and never press it in a loop or on a timer. Extra presses can
+  skip scenes and make the timings and screenshots of a boot unreliable.
+- Check with a screenshot that the prompt is up before pressing. Press a second time only if a new
+  screenshot still shows the prompt. A black window, a frame counter that stands still or 0 fps
+  after the press is loading or shader compilation.
+- Judge progress, shader counts and frame timing only after Cross has been pressed.
+
 ## Feedback loop
 
 After every test run of the target title, run `python scripts/triage-log.py <log>` and act on
