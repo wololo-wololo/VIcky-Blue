@@ -228,12 +228,8 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		value.dwords.fill(0u);
 		return true;
 	}
-	// Approximation: an indexed formatted load through a raw-bounds (OOB_SELECT=3) descriptor is
-	// bounded by its record count like a structured one. Hardware leaves the index out of that
-	// check, so only loads past the end of the buffer differ: they read zero here.
-	const bool raw_indexed_read = indexed && formatted_read && descriptor.OutOfBounds() == 3u;
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	    (descriptor.OutOfBounds() != (indexed ? 0u : 3u) && !raw_indexed_read)) {
+	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
 		return SpecializationFail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
