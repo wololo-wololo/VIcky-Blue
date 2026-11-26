@@ -22,6 +22,7 @@
 #include <mutex>
 #include <queue>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -295,6 +296,11 @@ private:
 	                            const ModuleMap& modules);
 };
 
+// Names the caches of a title that has no id (a dump without sce_sys/param.json). Without a
+// call such a title has no caches, which is what the unit tests rely on. Its caches then share
+// one name, like its sandbox directories: the driver cache keys entries by content and the
+// shader store is rebuilt when its header differs.
+void SetUntitledPipelineCacheName(std::string name);
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
