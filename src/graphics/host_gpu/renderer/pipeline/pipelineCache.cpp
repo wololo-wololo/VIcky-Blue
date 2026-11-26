@@ -462,9 +462,29 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
 	};
+	bool tracked = true;
 	try {
 		translate(entry == m_program_cache.end());
 	} catch (const ShaderRecompiler::IR::UnsupportedComputeShader&) {
+		tracked = false;
+	}
+	if (!tracked && !options.gpu_table_descriptors &&
+	    (current == nullptr || current->calls.empty())) {
+		// A store through a descriptor the host cannot evaluate fails tracking. Translate again
+		// with such descriptors left to the GPU, which reads the V# and stores through its
+		// device address, as after a failed specialization below.
+		options.gpu_table_descriptors = true;
+		try {
+			translate(false);
+			tracked = true;
+			PipelineCacheLog("shader=0x{:016x} stage={}: resource tracking failed; buffer "
+			                 "descriptors are read on the GPU",
+			                 params.hash, static_cast<int>(options.stage));
+		} catch (const ShaderRecompiler::IR::UnsupportedComputeShader&) {
+			options.gpu_table_descriptors = false;
+		}
+	}
+	if (!tracked) {
 		ShaderRecompiler::Capture::Save("tracking", params.code, options);
 		PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
 		                 "reason=resource tracking failed; rendering is incomplete",
@@ -481,13 +501,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
 		entry = m_program_cache.emplace(m_lookup_key, Program {
-		    .call_source   = std::move(retained),
-		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		    .call_source           = std::move(retained),
+		    .resource_plan         = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		    .gpu_table_descriptors = options.gpu_table_descriptors,
 		}).first;
 		auto& program = entry->second;
 		bool materialized = ShaderRecompiler::IR::MaterializeResources(
 		    program.resource_plan, runtime, program.resources, program.specialization);
-		if (!materialized && program.call_source == nullptr) {
+		if (!materialized && program.call_source == nullptr && !options.gpu_table_descriptors) {
 			// A buffer descriptor table can hold more candidates than the host can enumerate and
 			// bind. Translate again with such descriptors left to the GPU, which reads the V# it
 			// selects and accesses memory through its device address.

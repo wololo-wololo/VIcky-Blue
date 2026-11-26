@@ -58412,7 +58412,7 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 static int ReplayCapturedShaders(const char *folder) {
   using namespace Libs::Graphics;
   namespace fs = std::filesystem;
-  uint32_t passed = 0, failed = 0, calls = 0, skipped = 0;
+  uint32_t passed = 0, gpu_read = 0, failed = 0, calls = 0, skipped = 0;
   std::error_code error;
   for (const auto &entry : fs::recursive_directory_iterator(folder, error)) {
     if (!entry.is_regular_file() || entry.path().extension() != ".kshc") {
@@ -58454,7 +58454,15 @@ static int ReplayCapturedShaders(const char *folder) {
         calls++;
         continue;
       }
-      const auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+      ShaderRecompiler::TranslateResult translated;
+      try {
+        translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+      } catch (const ShaderRecompiler::IR::UnsupportedComputeShader &) {
+        // Like the pipeline cache: retry with buffer descriptors left to the GPU.
+        options.gpu_table_descriptors = true;
+        translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+        gpu_read++;
+      }
       // The pipeline cache extracts the plan next; name the capture first, in case that hangs.
       std::printf("replay: plan %s\n", entry.path().filename().string().c_str());
       (void)ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
@@ -58474,8 +58482,9 @@ static int ReplayCapturedShaders(const char *folder) {
           ShaderRecompiler::PrepareShaderSource(shader.code, options).decoded);
     }
   }
-  std::printf("replay: passed=%u failed=%u needs_runtime_calls=%u skipped=%u\n",
-              passed, failed, calls, skipped);
+  std::printf("replay: passed=%u (with GPU-read descriptors %u) failed=%u needs_runtime_calls=%u "
+              "skipped=%u\n",
+              passed, gpu_read, failed, calls, skipped);
   return failed == 0 ? 0 : 1;
 }
 

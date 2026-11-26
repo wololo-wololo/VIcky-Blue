@@ -4473,9 +4473,11 @@ private:
 					return;
 				}
 				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
-				if (source == UINT32_MAX && memory.kind == ResourceKind::Buffer &&
-				    memory.SupportsIndirectBufferStore(op)) {
+				if (m_gpu_table_descriptors && source == UINT32_MAX &&
+				    memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferStore(op)) {
 					// The shader holds the V# itself: the store goes through its device address.
+					// Only on request (a retry after tracking failed), so that by default a
+					// descriptor the host cannot evaluate still fails tracking.
 					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 					return;
 				}
