@@ -89,14 +89,14 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+// Cache name of a title without an id; empty (no caches) unless the emulator sets one.
+std::string g_untitled_cache_name;
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
 	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		// A dump without sce_sys/param.json has no id. Its caches share one name, like its
-		// sandbox directories: the driver cache keys entries by content and the shader store
-		// is rebuilt when its header differs, so a second such title only costs reuse.
-		return "UNKNOWN";
+		return g_untitled_cache_name;
 	}
 	if (!std::ranges::all_of(title_id, [](unsigned char c) {
 		    return std::isalnum(c) != 0 || c == '-' || c == '_';
@@ -196,6 +196,10 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
 	        .ray_query              = graphics.ray_query_enabled};
+}
+
+void SetUntitledPipelineCacheName(std::string name) {
+	g_untitled_cache_name = std::move(name);
 }
 
 std::filesystem::path ShaderStorePath() {
