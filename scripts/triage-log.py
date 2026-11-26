@@ -137,6 +137,15 @@ def parse(path):
                     ["workaround-debt", "area: shader"],
                     "Compute shaders were skipped by the temporary workaround.").add(shader)
                 continue
+            m = re.search(r"TEMPORARY DRAW SKIP !!! shader=(0x[0-9a-f]+) stage=\d+ reason=([a-z ]+)", line)
+            if m:
+                shader, reason = m.group(1), m.group(2).strip()
+                get("draw-skip:" + reason.replace(" ", "-"),
+                    "renderer: draw skipped (%s)" % reason,
+                    ["workaround-debt", "area: shader"],
+                    "Draws were dropped by the temporary workaround because a vertex or pixel "
+                    "shader could not be used.").add(shader)
+                continue
 
             m = re.match(r"\s*Equeue wait timedout: (.+)", line)
             if m:

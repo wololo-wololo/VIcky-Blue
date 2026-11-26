@@ -46,22 +46,37 @@ Known state:
 - The intro only starts with three temporary debug workarounds, none of them a fix:
   - `KYTY_RAW_PATCH=847c4d7:7413:9090,847c411:0f83cd000000:909090909090` disables the title's
     main-loop watchdog, which otherwise ends the title after a 30 s stall. First-boot shader
-    compilation (about 750 shaders in one burst, ~36 ms each) stalls the main loop for longer.
+    compilation (about 750 shaders in one burst, ~36 ms each) stalls the main loop for longer
+    ([#14](https://github.com/wololo-wololo/VIcky-Blue/issues/14)).
   - `KYTY_SKIP_SHADERS=05dc60d7ff9e4fce` drops one compute shader that makes the host GPU report
     `VK_ERROR_DEVICE_LOST` on its larger dispatches. Vulkan validation and GPU-assisted validation
-    report nothing for it. `KYTY_GPU_FAULT_TRACE=1` is the trace that identified it.
+    report nothing for it. `KYTY_GPU_FAULT_TRACE=1` is the trace that identified it
+    ([#13](https://github.com/wololo-wololo/VIcky-Blue/issues/13)).
   - `--shader-cache` keeps compiled shaders between boots.
 - Compute dispatches and, new, draws whose shader resources cannot be tracked or specialized are
   skipped by a temporary workaround, which is the main reason the image is incomplete
-  ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2), [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3)). The failures seen are GPU-selected buffer
+  ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2), [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3), [#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)). The failures seen are GPU-selected buffer
   descriptors, indirect buffer tables over the 65536-row limit, and atomic image operations on
   32_32Float and other non-32-bit-integer images.
+  - GPU-selected descriptors read with typed (`tbuffer_load_format_x/xy/xyz/xyzw`) loads now
+    translate. In a boot to the intro the number of distinct skipped shaders went from 231 to
+    26 (4 resource tracking failures, 22 specialization failures). What is left on the tracking
+    side is a store or atomic on a GPU-selected descriptor
+    ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2)).
+  - Raw indexed stores and 32-bit atomic add/or on GPU-selected descriptors with a bounded key,
+    and descriptors whose base is picked by a scalar branch on a value read through the user-data
+    pointer, now track. A boot to the intro no longer reports any resource tracking failure; what
+    is left are the specialization failures
+    ([#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3)). The shaders that were skipped
+    are large (about 363k SPIR-V words on average, 131 of 195 over 400k), so a first boot takes
+    much longer to compile them ([#14](https://github.com/wololo-wololo/VIcky-Blue/issues/14)).
 - Two system library functions the title calls are not implemented yet
   ([#5](https://github.com/wololo-wololo/VIcky-Blue/issues/5), [#6](https://github.com/wololo-wololo/VIcky-Blue/issues/6)).
 - The title needs `KYTY_LARGE_MEMORY=1` set to get enough guest memory ([#9](https://github.com/wololo-wololo/VIcky-Blue/issues/9)).
 
 Resolved since the last status: the shader decode abort right after the loading logo
-([#1](https://github.com/wololo-wololo/VIcky-Blue/issues/1), fixed in `f5d84d2b`), which was the previous boot blocker.
+([#1](https://github.com/wololo-wololo/VIcky-Blue/issues/1), fixed in `f5d84d2b`), which was the previous boot blocker, and the GPU flip
+events that never arrived ([#7](https://github.com/wololo-wololo/VIcky-Blue/issues/7)), which went away with it.
 
 Windows is where the fork is developed and tested. The Linux and macOS code paths are inherited
 from upstream and are not tested here.
