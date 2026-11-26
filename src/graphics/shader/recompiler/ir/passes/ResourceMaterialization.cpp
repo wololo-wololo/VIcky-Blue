@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
@@ -973,9 +974,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		                   : format != Prospero::BufferFormat::k32UInt &&
 		                         format != Prospero::BufferFormat::k32SInt &&
 		                         format != Prospero::BufferFormat::k32Float)) {
-			return SpecializationFail(
-			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+			// TEMPORARY workaround: the host has no atomics for this format, so the image is bound
+			// as null instead of failing the whole draw or dispatch. Its atomics read zero and
+			// write nothing, and so does every other storage access to the same T#.
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1u) < 32u) {
+				std::fprintf(stderr,
+				             "shader resource specialization: TEMPORARY: atomic image descriptor %u "
+				             "uses unsupported format %u and is bound as null: "
+				             "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				             i, static_cast<uint32_t>(format), descriptor.dwords[0],
+				             descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3],
+				             descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6],
+				             descriptor.dwords[7]);
+			}
+			snapshot.images[i].dwords.fill(0u);
+			image.dimension     = base.dimension;
+			image.cube          = base.cube;
+			image.mip_count     = ImageMipCount(base, snapshot.images[i]);
+			image.numeric_class = Prospero::TextureNumericClass::Uint;
+			continue;
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
