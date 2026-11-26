@@ -89,11 +89,14 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+// Cache name of a title without an id; empty (no caches) unless the emulator sets one.
+std::string g_untitled_cache_name;
+
 std::string PipelineCacheTitleId() {
 	std::string title_id;
 	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
 	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
+		return g_untitled_cache_name;
 	}
 	if (!std::ranges::all_of(title_id, [](unsigned char c) {
 		    return std::isalnum(c) != 0 || c == '-' || c == '_';
@@ -195,6 +198,10 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .ray_query              = graphics.ray_query_enabled};
 }
 
+void SetUntitledPipelineCacheName(std::string name) {
+	g_untitled_cache_name = std::move(name);
+}
+
 std::filesystem::path ShaderStorePath() {
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE || !Config::ShaderCacheEnabled() ||
 	    Config::GraphicsDebugDumpEnabled()) {
@@ -230,9 +237,11 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 ShaderRecompiler::IR::PushData::Window push_data) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+                                                 ShaderRecompiler::IR::PushData::Window push_data,
+                                                 bool&                                  specialized) {
+	specialized = ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                         specialization);
+	if (!specialized) return nullptr;
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
@@ -303,6 +312,22 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
+// TEMPORARY WORKAROUND: a program that specialized before can meet descriptor tables that no
+// longer do, for instance rows the guest rewrote or has not filled yet. That dispatch or draw is
+// dropped, like a first-time failure, but the program stays usable for the next one.
+const ShaderModule* PipelineCache::SkipRespecialization(Program& program, uint64_t hash,
+                                                        ShaderType stage) {
+	if (!program.respecialization_reported) {
+		program.respecialization_reported = true;
+		PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
+		                 "reason=resource specialization failed on a later use; rendering is "
+		                 "incomplete",
+		                 stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW", hash,
+		                 static_cast<int>(stage));
+	}
+	return nullptr;
+}
+
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               ShaderRecompiler::IR::PushData::Window& push_data) {
@@ -350,13 +375,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	if (entry != m_program_cache.end()) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
-		ShaderModule* module = nullptr;
+		ShaderModule* module      = nullptr;
+		bool          specialized = true;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data);
+			if (!source_changed) module = cached.FindModule<true>(runtime, push_data, specialized);
 		} else {
-			module = cached.FindModule<false>(runtime, push_data);
+			module = cached.FindModule<false>(runtime, push_data, specialized);
 		}
+		if (!specialized) return SkipRespecialization(cached, params.hash, options.stage);
 		if (module != nullptr) return bind(*module);
 	}
 
@@ -426,9 +453,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data)) {
+		bool specialized = true;
+		if (const auto* module = entry->second.FindModule<true>(runtime, push_data, specialized)) {
 			return bind(*module);
 		}
+		if (!specialized) return SkipRespecialization(entry->second, params.hash, options.stage);
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data));

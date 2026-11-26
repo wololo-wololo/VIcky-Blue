@@ -14080,6 +14080,54 @@ public:
         }
       }
 
+      // A shader that specialized once can meet a table that no longer does, because the guest
+      // rewrote a row. That dispatch is skipped; it must neither abort the title nor condemn
+      // the shader, whose next dispatch with a usable table still runs.
+      {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(table_shader.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true,
+                             .tgid_y_en = true, .tgid_z_en = true});
+        shaders.SetCsUserSgpr(0, static_cast<u32>(parameters));
+        shaders.SetCsUserSgpr(1, static_cast<u32>(parameters >> 32u));
+        const auto write_rows = [&](Prospero::ImageType second_type) {
+          std::array<u32, 74> table{};
+          for (u32 row = 0; row < 2u; row++) {
+            const auto address = base + 0x90000 + row * 0x10000;
+            const auto type = row == 0u ? Prospero::ImageType::kColor2D : second_type;
+            const ShaderTextureResource sharp{{static_cast<u32>(address >> 8u),
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 20u) | (3u << 30u),
+                1u << 14u,
+                DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                    (static_cast<u32>(type) << 28u),
+                0, 0x00700000u, 0, 0}};
+            std::copy_n(sharp.fields, 8, table.begin() + row * 37);
+          }
+          Require(name, "rewritten table refresh",
+                  context.InvalidateMemory(table_address, sizeof(table)),
+                  "the descriptor table escaped its mapped allocation");
+          LibKernel::Memory::WriteBacking(table_address, table.data(), sizeof(table));
+        };
+        const auto dispatch_program = [&] {
+          ShaderComputeInputInfo input{};
+          input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
+          input.workgroup_counts[2] = 2;
+          return context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+        };
+        write_rows(Prospero::ImageType::kColor2D);
+        const auto usable = dispatch_program();
+        Require(name, "usable table before rewrite", usable != nullptr,
+                "the fixture table did not specialize");
+        write_rows(Prospero::ImageType::kColor3D);
+        Require(name, "unusable table skips the dispatch", dispatch_program() == nullptr,
+                "a cached shader whose table no longer specializes still ran");
+        write_rows(Prospero::ImageType::kColor2D);
+        const auto restored = dispatch_program();
+        Require(name, "usable table after rewrite",
+                restored != nullptr && usable != nullptr && restored->id == usable->id,
+                "one unusable table permanently skipped the shader");
+      }
+
       // GPU-written dispatch counts bound the stride12 selector prefix; only
       // those keys select the two real descriptor members in each stride192 row.
       constexpr auto record_args = base + 0xd0000;
@@ -37856,6 +37904,160 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
 }
 
+// TBUFFER_LOAD_FORMAT_XY through a descriptor the shader loads at runtime. A tbuffer load carries
+// its format in the instruction, so each format is its own program and the descriptor only supplies
+// the address, stride, bounds and OOB mode. The descriptor format is deliberately wrong (8_UInt)
+// to prove the instruction format is the one that decodes. With `with_index` the load uses
+// IDXEN+OFFEN, otherwise OFFEN only.
+TestCase TBufferLoadFormatXyGpuSelectedDescriptors(const char *name, u32 wave,
+                                                   Prospero::BufferFormat format, bool with_index) {
+  using F = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  const u32 bytes = ShaderRecompiler::Format::GetFormatInfo(format).byte_size;
+  // +/-32767 and 0 decode to exactly +/-1.0 and 0.0 as SNORM16; the last two dwords are normal floats.
+  constexpr std::array<u32, 4> payload{0x80017fffu, 0x00007fffu, 0x40003c00u, 0x3fc00000u};
+  struct Row {
+    u32 stride, records, mode, index, offset, soffset;
+    bool valid;
+  };
+  std::vector<Row> rows{
+      {0, 64, 3, 0, 0, 0, true},                // raw, address 0
+      {0, 64, 3, 0, bytes, 0, true},            // raw, second element via the offset
+      {0, 64, 3, 0, 0, bytes, true},            // raw, second element via SOFFSET
+      {0, bytes - 1, 3, 0, 0, 0, false},        // raw, record smaller than the format: no transfer
+      {bytes, 4, 0, 0, 0, 0, true},             // structured, index 0
+  };
+  if (with_index) {
+    rows.push_back({bytes, 4, 0, 1, 0, 0, true});  // structured, index 1
+    rows.push_back({bytes, 4, 0, 4, 0, 0, false}); // structured, index == records
+  }
+  const auto address_of = [&](const Row &row) { return row.index * row.stride + row.offset + row.soffset; };
+  const auto read = [&](u32 address, u32 size) {
+    u32 value = 0;
+    for (u32 byte = 0; byte < size; ++byte)
+      value |= ((payload[(address + byte) / 4u] >> (((address + byte) % 4u) * 8u)) & 0xffu) << (byte * 8u);
+    return value;
+  };
+  const auto decode = [&](u32 address, u32 component) -> u32 {
+    switch (format) {
+    case F::k32_32Float:
+    case F::k32_32UInt: return read(address + component * 4u, 4u);
+    case F::k16_16UInt: return read(address + component * 2u, 2u);
+    case F::k8_8UInt: return read(address + component, 1u);
+    case F::k16_16SNorm:
+      return std::bit_cast<u32>(float(static_cast<int16_t>(read(address + component * 2u, 2u))) / 32767.0f);
+    default: return 0u;
+    }
+  };
+  TestCase test;
+  test.name = name;
+  const auto align256 = [](u32 size) { return (size + 255u) & ~255u; };
+  const auto count = static_cast<u32>(rows.size());
+  const auto selection_base = align256(count * 8u);
+  const auto descriptor_base = align256(selection_base + count * 4u);
+  const auto payload_base = align256(descriptor_base + count * 32u);
+  test.initial.resize((payload_base + count * 64u) / 4u);
+  for (u32 i = 0; i < count; ++i) {
+    const auto &input = rows[i];
+    const u32 data_offset = payload_base + i * 64u;
+    const std::array<u32, 8> row{
+        static_cast<u32>(GuestBase + data_offset), 1u | (input.stride << 16u), input.records,
+        4u | (static_cast<u32>(F::k8UInt) << 12u) | (input.mode << 28u),
+        input.index, input.offset, input.soffset, 0u};
+    std::copy(row.begin(), row.end(), test.initial.begin() + descriptor_base / 4u + i * 8u);
+    std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4u);
+    // Select the row on the GPU, as a descriptor waterfall does.
+    test.initial[selection_base / 4u + i] = count - 1u - i;
+  }
+  for (u32 i = 0; i < count; ++i) {
+    const auto &input = rows[count - 1u - i];
+    for (u32 component = 0; component < 2u; ++component)
+      test.expected.push_back(input.valid ? decode(address_of(input), component) : 0u);
+  }
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 28, 0);
+  AppendSMovLiteral(&code, 29, count);
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeVop1(0x01, 30, 28));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
+  code.push_back(EncodeMubuf0(0x0c, selection_base));
+  code.push_back(EncodeMubuf1(2, 0, 30));
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(2)));
+  code.push_back(EncodeSop2(0x1e, 20, 20, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x0b, 8, 0));
+  code.push_back(EncodeSmem1(descriptor_base, 20));
+  code.push_back(EncodeVop1(0x01, 21, 12));
+  code.push_back(EncodeVop1(0x01, 22, 13));
+  const auto encoded_format = BufferFormat(format);
+  code.push_back(EncodeMtbuf0(1u, encoded_format & 0xfu, (encoded_format >> 4u) & 0x7u, 0, with_index, true));
+  code.push_back(EncodeMtbuf1(1u, 4, 2, with_index ? 21 : 22, 14));
+  // Output record i is two dwords at i * 8.
+  code.push_back(EncodeVop1(0x01, 30, 28));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(3), 30));
+  AppendBufferStoreDword(&code, 4, 30);
+  code.push_back(EncodeVop2(0x25, 31, 255, 30));
+  code.push_back(4u);
+  AppendBufferStoreDword(&code, 5, 31);
+  code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 28, 29));
+  code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  // The typed indirect path shares the scalar formatted load; it must not fall back to a native buffer.
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", "convert_indirect_buffer_format"};
+  return test;
+}
+
+// Typed (tbuffer) loads are the only typed accesses the indirect buffer path accepts, and only
+// formatted ones of 1-4 components. Stores, atomics and untyped wide formatted loads stay native.
+void CheckTypedIndirectBufferLoadSupport() {
+  using namespace ShaderRecompiler::IR;
+  const auto supports = [](bool typed, bool formatted, u32 bits, ValueOpcode opcode) {
+    MemoryInfo memory;
+    memory.typed = typed;
+    memory.formatted = formatted;
+    memory.data_bits = bits;
+    return memory.SupportsIndirectBufferLoad(opcode);
+  };
+  for (const auto opcode : {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+                            ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4})
+    Require("TypedIndirectBufferLoadSupport", "typed formatted 1-4 components",
+            supports(true, true, 32u, opcode), "typed formatted tbuffer load was rejected");
+  Require("TypedIndirectBufferLoadSupport", "typed requires formatted",
+          !supports(true, false, 32u, ValueOpcode::LoadBufferU32x2), "typed raw load was accepted");
+  Require("TypedIndirectBufferLoadSupport", "typed 8/16-bit", !supports(true, true, 8u, ValueOpcode::LoadBufferU8) &&
+              !supports(true, true, 16u, ValueOpcode::LoadBufferU16), "typed sub-dword load was accepted");
+  Require("TypedIndirectBufferLoadSupport", "typed stores and atomics",
+          !supports(true, true, 32u, ValueOpcode::StoreBufferU32) &&
+              !supports(true, true, 32u, ValueOpcode::BufferAtomicIAdd32), "typed store or atomic was accepted");
+  Require("TypedIndirectBufferLoadSupport", "untyped formatted stays X only",
+          supports(false, true, 32u, ValueOpcode::LoadBufferU32) &&
+              !supports(false, true, 32u, ValueOpcode::LoadBufferU32x2), "untyped formatted rule changed");
+  std::printf("[compute] %-32s ok\n", "TypedIndirectBufferLoadSupport");
+}
+
+struct TBufferLoadXyCase {
+  const char *name;
+  u32 wave;
+  Prospero::BufferFormat format;
+  bool with_index;
+};
+
+// The first two are the shape the target title uses: OFFEN only, packed 16_16 SNORM.
+constexpr std::array TBufferLoadXyCases{
+    TBufferLoadXyCase{"TBufferLoadXySnorm16OffenGpuSelected32", 32u, Prospero::BufferFormat::k16_16SNorm, false},
+    TBufferLoadXyCase{"TBufferLoadXySnorm16OffenGpuSelected64", 64u, Prospero::BufferFormat::k16_16SNorm, false},
+    TBufferLoadXyCase{"TBufferLoadXySnorm16IdxenGpuSelected32", 32u, Prospero::BufferFormat::k16_16SNorm, true},
+    TBufferLoadXyCase{"TBufferLoadXyFloat32IdxenGpuSelected32", 32u, Prospero::BufferFormat::k32_32Float, true},
+    TBufferLoadXyCase{"TBufferLoadXyFloat32OffenGpuSelected64", 64u, Prospero::BufferFormat::k32_32Float, false},
+    TBufferLoadXyCase{"TBufferLoadXyUint16IdxenGpuSelected32", 32u, Prospero::BufferFormat::k16_16UInt, true},
+    TBufferLoadXyCase{"TBufferLoadXyUint8IdxenGpuSelected32", 32u, Prospero::BufferFormat::k8_8UInt, true},
+};
+
 TestCase BufferLoadUshortGpuSelectedDescriptors() {
   return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_USHORT);
 }
@@ -45486,27 +45688,52 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
-  for (const bool wide : {false, true})
+  // Modes: signed bytes, RGBA16 float records, unsigned halfwords, and unsigned halfwords in
+  // records wider than the format.
+  for (const u32 mode : {0u, 1u, 2u, 3u, 4u, 5u})
   for (const u32 wave : {32u, 64u}) {
+    // Mode 5 stores one dword to a four-component float record, which zero-fills the rest.
+    const bool rgba32 = mode == 5u;
+    const bool wide = mode == 1u, half = mode == 2u || mode == 3u;
+    const u32 half_stride = mode == 3u ? 12u : 2u;
+    const u32 byte_stride = mode == 4u ? 12u : 1u;
     const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
     const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
     TestCase test;
-    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
+    test.name = wide ? "GpuSelectedFormattedRgba16Store"
+                : mode == 3u ? "GpuSelectedFormattedStridedUInt16Store"
+                : mode == 4u ? "GpuSelectedFormattedStridedRecordStore"
+                : rgba32 ? "GpuSelectedFormattedRgba32DwordStore"
+                : half ? "GpuSelectedFormattedUInt16Store" : "GpuSelectedFormattedRecordStore";
     test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
     auto bytes = std::as_writable_bytes(std::span(test.initial));
     if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
     for (u32 row = 0; row < 6u; ++row) {
       if (wide && row != 0u && row != 3u) continue;
-      const std::array descriptor{slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
+      const std::array descriptor{slot * (row + 1u),
+          (wide ? 8u : rgba32 ? 16u : half ? half_stride : byte_stride) << 16u, 20u,
           wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7)
-               : (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+          : rgba32 ? (u32(Prospero::BufferFormat::k32_32_32_32Float) << 12u) | DstSel(4, 5, 6, 7)
+               : (u32(half ? Prospero::BufferFormat::k16UInt : Prospero::BufferFormat::k8SInt) << 12u) |
+                     DstSel(4, 0, 0, 0)};
       std::copy(descriptor.begin(), descriptor.end(),
                 test.initial.begin() + (table + (wide ? row * 16u : row * stride + member)) / 4u);
       for (u32 element = 0; element < 20u; ++element) {
         if (wide) {
           test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
           test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] = 0x38003400u;
-        } else bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
+        } else if (rgba32) {
+          // x is a normal float; the other channels must be zeroed by a store.
+          const auto record = slot * (row + 1u) / 4u + element * 4u;
+          test.initial[record] = 0x3f800000u + row * 0x100u + element;
+          test.initial[record + 1u] = 0xdead0001u;
+          test.initial[record + 2u] = 0xdead0002u;
+          test.initial[record + 3u] = 0xdead0003u;
+        } else if (half) {
+          const u32 value = 0x2000u + row * 0x100u + element;
+          bytes[slot * (row + 1u) + element * half_stride] = std::byte(value & 255u);
+          bytes[slot * (row + 1u) + element * half_stride + 1u] = std::byte(value >> 8u);
+        } else bytes[slot * (row + 1u) + element * byte_stride] = std::byte(0x80u + row + element);
       }
     }
     auto records = MakeStructuredStorageBufferData(stride, 6u);
@@ -45556,7 +45783,8 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
         AppendVMovLiteral(&code, vgpr, bits);
     } else {
       code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
-      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+      // Halfwords stay in range, so the check does not depend on how an overflow converts.
+      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), rgba32 ? 0x40000000u : half ? 0x100u : u32(-200)});
     }
     AppendSMovLiteral(&code, 126, 0x55555555u);
     AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
@@ -45582,7 +45810,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
         offset += words.size();
       }
       Require(test.name, "one shared store after the null candidate",
-              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u) * (rgba32 ? 4u : 1u),
               "homogeneous children duplicated the native store per descriptor");
     }
     u32 bda_loads = 0, native_stores = 0;
@@ -45628,12 +45856,23 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
       for (u32 lane = 0; lane < wave; ++lane) {
         const bool valid = wide ? row == 0u || row == 3u : row < 6u;
         test.expected[slot * 7u / 4u + group * wave + lane] =
-            valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
+            valid && lane < 20u ? (wide ? 0x3f800000u
+                                   : rgba32 ? 0x3f800000u + row * 0x100u + lane
+                                   : half ? 0x2000u + row * 0x100u + lane
+                                          : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
         if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
           if (wide) {
             test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
             test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
-          } else expected_bytes[slot * (row + 1u) + lane] =
+          } else if (rgba32) {
+            const auto record = slot * (row + 1u) / 4u + lane * 4u;
+            test.expected[record] = 0x40000000u + lane * 32u;
+            test.expected[record + 1u] = test.expected[record + 2u] = test.expected[record + 3u] = 0u;
+          } else if (half) {
+            const u32 value = lane * 32u + 0x100u;
+            expected_bytes[slot * (row + 1u) + lane * half_stride] = std::byte(value & 255u);
+            expected_bytes[slot * (row + 1u) + lane * half_stride + 1u] = std::byte(value >> 8u);
+          } else expected_bytes[slot * (row + 1u) + lane * byte_stride] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
         }
       }
@@ -45919,6 +46158,96 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     }
   }
   std::printf("[compute] %-32s ok\n", test.name);
+}
+
+// Atomics through a GPU-selected descriptor must reach the selected candidate, like stores.
+void CheckIndirectBufferAtomic(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  for (const auto opcode : {ValueOpcode::BufferAtomicIAdd32, ValueOpcode::BufferAtomicOr32}) {
+    const bool add = opcode == ValueOpcode::BufferAtomicIAdd32;
+    TestCase test;
+    test.name = add ? "IndirectBufferAtomicAdd" : "IndirectBufferAtomicOr";
+    test.initial.assign(64, 0x0000a5a5u);
+    test.storage_buffer_range_bytes = 64;
+    test.storage_buffer_offsets = {12, 108};
+
+    CompiledShader compiled;
+    auto &program = compiled.program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 32;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    program.shader_info_complete = true;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+
+    auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+    auto &selector = block->AppendNewInst(ValueOpcode::BitwiseAnd32, {Value(&lane), Value(7u)});
+    auto &key = block->AppendNewInst(ValueOpcode::IAdd32, {Value(&selector), Value(8u)});
+    auto &selection = block->AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&key)});
+    selection.SetFlags<uint32_t>(0u);
+    auto &handle = block->AppendNewInst(ValueOpcode::GetBufferResource,
+        {Value(&selection), Value(0u), Value(0u), Value(0u)});
+    handle.SetFlags<uint32_t>(0u);
+    auto &overflow = block->AppendNewInst(ValueOpcode::IEqual32, {Value(&lane), Value(6u)});
+    auto &index = block->AppendNewInst(ValueOpcode::SelectU32,
+        {Value(&overflow), Value(0x40000000u), Value(&lane)});
+    auto &data = block->AppendNewInst(ValueOpcode::IAdd32, {Value(&lane), Value(0x1000u)});
+    auto &exec = block->AppendNewInst(ValueOpcode::INotEqual32, {Value(&lane), Value(4u)});
+    block->AppendNewInst(opcode, {Value(&handle), Value(&index), Value(0u), Value(0u),
+                                  Value(&data), Value(&exec)});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .idxen = true});
+
+    BufferResource root;
+    root.packed_stride = 4;
+    root.written = true;
+    root.indirect_root = 0;
+    root.indirect_mapping_offset = 4;
+    root.indirect_search_iterations = std::bit_width(3u);
+    root.indirect_resources = {0u, 1u};
+    auto candidate = root;
+    candidate.indirect_search_iterations = 0;
+    candidate.indirect_resources.clear();
+    program.info.buffers = {root, candidate};
+    program.descriptor_sources.resize(1);
+    program.descriptor_sources[0].indirect_descriptor =
+        DescriptorSource::IndirectDescriptor{.table_stride = 16, .indexed = true};
+    ShaderComputeInputInfo compute;
+    compute.wave_size = 32;
+    compute.host_subgroup_size = vulkan.SubgroupSize();
+    compute.threads_num[0] = 32;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    PushData::Window push_data;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_data);
+    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
+    compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
+    ValidateSpirv(test.name, compiled.spirv);
+    CheckSpirvEmission(test, compiled.spirv);
+
+    for (const bool swapped : {false, true}) {
+      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
+                                         10u, swapped ? 0u : 1u,
+                                         12u, swapped ? 1u : 0u,
+                                         14u, swapped ? 0u : 1u};
+      test.expected = test.initial;
+      for (u32 lane = 0; lane < 16u; ++lane) {
+        // Lane 4 is masked off, lane 6 is out of bounds, other keys have no candidate.
+        if (lane != 2u && lane != 10u && lane != 12u && lane != 14u) continue;
+        const u32 resource = (lane & 7u) == 4u ? swapped : !swapped;
+        auto &word = test.expected[test.storage_buffer_offsets[resource] / 4u + lane];
+        word = add ? word + 0x1000u + lane : word | (0x1000u + lane);
+      }
+      auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, output);
+      const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+      vulkan.DestroyBuffer(&output);
+      CompareWords(test, "atomic key selection, EXEC, bounds and unmapped keys", test.expected, actual);
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
 }
 
 void CheckFiniteFirstLaneImageChoice(VulkanHarness &vulkan) {
@@ -50488,6 +50817,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
+  for (const auto &tbuffer : TBufferLoadXyCases)
+    cases.push_back(TBufferLoadFormatXyGpuSelectedDescriptors(tbuffer.name, tbuffer.wave,
+                                                              tbuffer.format, tbuffer.with_index));
   AddCase(BufferLoadUshortGpuSelectedDescriptors);
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
@@ -58478,6 +58810,7 @@ int main(int argc, char **argv) {
     for (u32 groups : {1u, 2u}) RunCase(&vulkan, BufferStoreWorkgroupDescriptors(groups));
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
+    CheckIndirectBufferAtomic(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);
     CheckGpuSelectedRecordBufferAccess(vulkan);
     CheckGuardedWaterfallBufferRecords(vulkan);
@@ -58486,6 +58819,10 @@ int main(int argc, char **argv) {
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
+    for (const auto &tbuffer : TBufferLoadXyCases)
+      RunCase(&vulkan, TBufferLoadFormatXyGpuSelectedDescriptors(tbuffer.name, tbuffer.wave,
+                                                                 tbuffer.format, tbuffer.with_index));
+    CheckTypedIndirectBufferLoadSupport();
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
@@ -59350,6 +59687,7 @@ int main(int argc, char **argv) {
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
+  CheckIndirectBufferAtomic(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);
   CheckGpuSelectedRecordBufferAccess(vulkan);
   CheckGuardedWaterfallBufferRecords(vulkan);
@@ -59358,6 +59696,7 @@ int main(int argc, char **argv) {
   CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);
+  CheckTypedIndirectBufferLoadSupport();
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);
   CheckPointerImageTable(vulkan);

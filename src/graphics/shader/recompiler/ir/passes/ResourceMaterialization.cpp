@@ -228,8 +228,14 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		value.dwords.fill(0u);
 		return true;
 	}
+	// A stride-1 descriptor with byte bounds is indexed by byte, which is what the index check
+	// emitted for candidates computes, so it needs no record geometry of its own. A formatted
+	// access wider than a byte could then start on an unaligned byte, which the word-granular
+	// storage views would silently move to the containing word, so it keeps the aligned rules.
+	const bool byte_indexed = indexed && descriptor.Stride() == 1u && descriptor.OutOfBounds() == 3u &&
+	    (!resource.formatted || Format::GetFormatInfo(descriptor.Format()).byte_size == 1u);
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
+	    (descriptor.OutOfBounds() != (indexed ? 0u : 3u) && !byte_indexed)) {
 		return SpecializationFail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
@@ -245,12 +251,28 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		if (!formatted_read) {
 			const bool scalar = resource.max_byte_extent == 4u &&
 			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
-			     descriptor.Format() == Prospero::BufferFormat::k8SInt);
+			     descriptor.Format() == Prospero::BufferFormat::k8SInt ||
+			     descriptor.Format() == Prospero::BufferFormat::k8UInt ||
+			     descriptor.Format() == Prospero::BufferFormat::k16SInt ||
+			     descriptor.Format() == Prospero::BufferFormat::k16UInt);
 			const bool rgba16 = resource.max_byte_extent == 16u &&
 			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
-			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
-			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
-				return SpecializationFail("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records");
+			// A dword store to a four-component float record zero-fills the other channels.
+			const bool rgba32 = resource.max_byte_extent == 4u &&
+			    descriptor.Format() == Prospero::BufferFormat::k32_32_32_32Float;
+			// A one-component format's missing channels default to 0,0,0 or 0,0,1, both identity.
+			const auto selects = descriptor.DstSelXYZW();
+			const bool identity = rgba16 || rgba32 ? selects == DstSel(4, 5, 6, 7)
+			                             : selects == DstSel(4, 0, 0, 0) || selects == DstSel(4, 0, 0, 1);
+			// Byte and halfword stores may sit in wider records; the alignment rules below cover
+			// them. Wider formats stay tight.
+			const bool tight_enough = descriptor.Stride() == format.byte_size || byte_indexed ||
+			    (scalar && format.byte_size < 4u && descriptor.Stride() > format.byte_size);
+			if ((!scalar && !rgba16 && !rgba32) || !tight_enough || !identity)
+				return SpecializationFail(fmt::format("indirect formatted stores require an identity 8- or 16-bit integer, UInt32, RGBA16Float or RGBA32Float "
+				    "records: descriptor={:08x},{:08x},{:08x},{:08x} stride={} format={} max_extent={}",
+				    value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+				    descriptor.Stride(), static_cast<uint32_t>(descriptor.Format()), resource.max_byte_extent));
 		}
 		if (formatted_read &&
 		    (descriptor.Base48() == 0u || descriptor.Stride() == 0u || descriptor.NumRecords() == 0u)) {
@@ -260,8 +282,8 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			return true;
 		}
 		const auto alignment = std::min(4u, format.byte_size);
-		if (descriptor.Stride() < format.byte_size ||
-		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
+		if ((!byte_indexed && (descriptor.Stride() < format.byte_size ||
+		                       (descriptor.Stride() & (alignment - 1u)) != 0u)) ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||
@@ -730,8 +752,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
-			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
-				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
+			// Pointer tables read each child, so only plain tables get the longer limit.
+			const auto row_limit = pointer == nullptr ? MaxIndirectTableRows : MaxIndirectDescriptorProbes;
+			if (child_count == 0u || (!image_heap && uint64_t {count} * child_count > row_limit))
+				return failed("candidate count", fmt::format("rows={} limit={}", count, row_limit));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
 			auto& heap_words = program.material_keys;
@@ -739,6 +763,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				heap_words.resize(table_size / 4u);
 				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
 					return read_failed("image heap read", 0u, 0u, table_base, 0u, heap_words.size() * sizeof(uint32_t));
+			}
+			// A long scalar table is read once instead of once per row.
+			const bool bulk = pointer == nullptr && !image_heap && count > 256u && (step & 3u) == 0u &&
+			    (first & 3u) == 0u;
+			if (bulk) {
+				const auto end = std::min<uint64_t>(table_size,
+				    first + uint64_t {count - 1u} * step + uint64_t {read_dwords} * 4u);
+				heap_words.resize((end - first) / 4u);
+				if (!ReadScalarTable(table_base, table_size, first, runtime, heap_words))
+					return read_failed("table read", 0u, 0u, table_base, first, heap_words.size() * sizeof(uint32_t));
 			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
@@ -759,6 +793,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						        std::span(candidate.dwords).first(read_dwords)))
 							return read_failed("child descriptor read", word, child, pointer_base,
 							    uint64_t {child} * pointer->stride + pointer->offset, descriptor_bytes);
+					} else if (bulk) {
+						const auto table_word = (table_offset - first) / 4u;
+						std::copy_n(heap_words.begin() + table_word,
+						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
+						            candidate.dwords.begin());
 					} else if (!image_heap) {
 						if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 						                     std::span(candidate.dwords).first(read_dwords))) return false;

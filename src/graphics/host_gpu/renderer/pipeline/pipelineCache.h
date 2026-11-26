@@ -22,6 +22,7 @@
 #include <mutex>
 #include <queue>
 #include <span>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -218,12 +219,17 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		// Set once a dispatch was skipped because the program no longer specialized.
+		bool                                         respecialization_reported = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// Returns the module matching the current resources, or null. `specialized` is false
+		// when the resources no longer specialize at all (the guest rewrote a descriptor table).
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         ShaderRecompiler::IR::PushData::Window  push_data);
+		                         ShaderRecompiler::IR::PushData::Window  push_data,
+		                         bool&                                   specialized);
 	};
 
 	struct ProgramKey {
@@ -265,6 +271,8 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	static const ShaderModule* SkipRespecialization(Program& program, uint64_t hash,
+	                                                ShaderType stage);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions       options,
 	                            ShaderRecompiler::TranslateResult      translated,
@@ -288,6 +296,11 @@ private:
 	                            const ModuleMap& modules);
 };
 
+// Names the caches of a title that has no id (a dump without sce_sys/param.json). Without a
+// call such a title has no caches, which is what the unit tests rely on. Its caches then share
+// one name, like its sandbox directories: the driver cache keys entries by content and the
+// shader store is rebuilt when its header differs.
+void SetUntitledPipelineCacheName(std::string name);
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();

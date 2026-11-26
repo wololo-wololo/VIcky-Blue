@@ -423,6 +423,11 @@ public:
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				m_address_writes |= AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::Write;
+			}
+		}
 	}
 
 	void Run() {
@@ -815,8 +820,10 @@ private:
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == targets[0] && term.false_block == targets[1]) ||
 		      (term.false_block == targets[0] && term.true_block == targets[1])) ||
-		    !ValidateRuntimeValue(m_program, info.condition, m_shader_writes
-		        ? RuntimeValueType::ImmutableInteger : RuntimeValueType::Integer) ||
+		    !ValidateRuntimeValue(m_program, info.condition,
+		        !m_shader_writes ? RuntimeValueType::Integer
+		        : m_address_writes ? RuntimeValueType::ImmutableInteger
+		                           : RuntimeValueType::StorageImmutableInteger) ||
 		    !ValidateRuntimeValue(m_program, inst->Arg(0)) ||
 		    !ValidateRuntimeValue(m_program, inst->Arg(1))) {
 			return value;
@@ -3005,7 +3012,9 @@ private:
 
 	bool IndirectBufferAccess(const Inst& inst) const {
 		const auto opcode = inst.GetOpcode();
-		if (opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::StoreBufferU32x2 &&
+		const bool atomic = opcode == ValueOpcode::BufferAtomicIAdd32 ||
+		                    opcode == ValueOpcode::BufferAtomicOr32;
+		if (!atomic && opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::StoreBufferU32x2 &&
 		    opcode != ValueOpcode::StoreBufferU8 &&
 		    opcode != ValueOpcode::StoreBufferU32x4 && opcode != ValueOpcode::LoadBufferU32x2 &&
 		    opcode != ValueOpcode::LoadBufferU32x3 && opcode != ValueOpcode::LoadBufferU32x4) return false;
@@ -3017,6 +3026,8 @@ private:
 		    inst.Arg(3).Resolve() != Value(0u)) return false;
 		if (memory.idxen && memory.offset != 0u &&
 		    (memory.formatted || memory.data_bits != 32u || (memory.offset & 3u) != 0u)) return false;
+		// Atomics follow the raw indexed DWORD store: the selected candidate receives the update.
+		if (atomic) return memory.idxen && !memory.formatted;
 		if (opcode == ValueOpcode::StoreBufferU32)
 			return !memory.formatted || (memory.idxen && memory.data_bits == 32u && memory.data_dwords == 1u);
 		if (!memory.idxen) return false;
@@ -3595,7 +3606,11 @@ private:
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
 		    handle.Uses().empty()) return false;
 		if (!IndirectBufferAccess(*handle.Uses().front().user)) return false;
-		const bool legacy_store = handle.Uses().front().user->GetOpcode() == ValueOpcode::StoreBufferU32;
+		// Raw DWORD stores and 32-bit atomics need a proven key range; wider accesses use the V# bound.
+		const auto first_access = handle.Uses().front().user->GetOpcode();
+		const bool legacy_store = first_access == ValueOpcode::StoreBufferU32 ||
+		                          first_access == ValueOpcode::BufferAtomicIAdd32 ||
+		                          first_access == ValueOpcode::BufferAtomicOr32;
 		const auto indexed = m_program.memory_info[handle.Uses().front().user->Flags<MemoryFlags>().index].idxen;
 		for (const auto& use: handle.Uses()) {
 			const auto& inst = *use.user;
@@ -3675,6 +3690,25 @@ private:
 			if (table_source.dword_count != 4u || plan.split_offsets) return false;
 			indirect.table_scalar = true;
 			return finish();
+		}
+		// An indexed raw store selects among the rows of a bounded V# table like the wider
+		// stores. Its waterfall key needs a proven maximum under the lane guard (for example
+		// a masked material field), so the byte offset of every row cannot wrap.
+		if (indexed && table_source.dword_count == 4u && !plan.split_offsets &&
+		    plan.selection_anchor != nullptr) {
+			const auto* lane = key.Resolve().TryInstruction();
+			if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
+			    std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+				    return Implies(use.user->Arg(use.user->NumArgs() - 1u), lane->Arg(1));
+			    })) {
+				const auto maximum = SelectorMaximum(lane->Arg(0), {}, 0u, lane->Arg(1));
+				if (maximum <= UINT32_MAX / 4u &&
+				    uint64_t {maximum} * table_stride + table_offset <= UINT32_MAX) {
+					indirect.table_maximum = maximum;
+					indirect.table_scalar = true;
+					return finish();
+				}
+			}
 		}
 		if (table_stride != 16u) return false;
 		if (table_source.dword_count == 2u) {
@@ -4557,6 +4591,7 @@ private:
 	std::map<const Inst*, Value>              m_descriptor_values;
 	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
 	bool                                       m_shader_writes = false;
+	bool                                       m_address_writes = false;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,

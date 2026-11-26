@@ -29,6 +29,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
+// A table scan reads every row once but binds only its distinct descriptors, so it may be longer.
+constexpr uint32_t MaxIndirectTableRows = 1u << 19u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -85,7 +88,13 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
+		// tbuffer loads carry their format in the instruction. The descriptor only supplies the
+		// address, so each output component is a formatted X load with a constant format/selector.
+		if (typed) {
+			return formatted && data_bits == 32u &&
+			       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+			        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+		}
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&

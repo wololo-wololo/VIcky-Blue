@@ -52,12 +52,37 @@ Known state:
     `VK_ERROR_DEVICE_LOST` on its larger dispatches. Vulkan validation and GPU-assisted validation
     report nothing for it. `KYTY_GPU_FAULT_TRACE=1` is the trace that identified it
     ([#13](https://github.com/wololo-wololo/VIcky-Blue/issues/13)).
-  - `--shader-cache` keeps compiled shaders between boots.
+  - `--shader-cache` keeps compiled shaders between boots. A dump without `sce_sys/param.json`
+    has no title id and stores them under the name `UNKNOWN`
+    ([#27](https://github.com/wololo-wololo/VIcky-Blue/issues/27)). The first boot still compiles
+    everything; with a complete cache the warm-up before the first frame took 30 s.
 - Compute dispatches and, new, draws whose shader resources cannot be tracked or specialized are
   skipped by a temporary workaround, which is the main reason the image is incomplete
   ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2), [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3), [#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)). The failures seen are GPU-selected buffer
   descriptors, indirect buffer tables over the 65536-row limit, and atomic image operations on
   32_32Float and other non-32-bit-integer images.
+  - GPU-selected descriptors read with typed (`tbuffer_load_format_x/xy/xyz/xyzw`) loads now
+    translate. In a boot to the intro the number of distinct skipped shaders went from 231 to
+    26 (4 resource tracking failures, 22 specialization failures). What is left on the tracking
+    side is a store or atomic on a GPU-selected descriptor
+    ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2)).
+  - Raw indexed stores and 32-bit atomic add/or on GPU-selected descriptors with a bounded key,
+    and descriptors whose base is picked by a scalar branch on a value read through the user-data
+    pointer, now track. A boot to the intro no longer reports any resource tracking failure; what
+    is left are the specialization failures
+    ([#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3)). The shaders that were skipped
+    are large (about 363k SPIR-V words on average, 131 of 195 over 400k), so a first boot takes
+    much longer to compile them ([#14](https://github.com/wololo-wololo/VIcky-Blue/issues/14)).
+  - Indirect buffer tables of up to 524288 rows now specialize, stride-one byte-bounds
+    descriptors are accepted as candidates for one-byte formats (SInt8 and UInt8 stores), and a
+    cached program whose descriptors later stop specializing is skipped with a log line instead
+    of aborting. Two of the shaders named in
+    [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3) are still skipped; the remaining
+    reasons are atomic image formats ([#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)),
+    formatted stores on wider strides, and pointer-table probes that read unmapped rows. A run
+    with these changes stayed in the intro for eight minutes without a guest fault; an earlier
+    version of the byte-bounds change let 2- and 4-byte formats address unaligned words and ended
+    the title with an audio decoder fault after two to three minutes.
 - Two system library functions the title calls are not implemented yet
   ([#5](https://github.com/wololo-wololo/VIcky-Blue/issues/5), [#6](https://github.com/wololo-wololo/VIcky-Blue/issues/6)).
 - The title needs `KYTY_LARGE_MEMORY=1` set to get enough guest memory ([#9](https://github.com/wololo-wololo/VIcky-Blue/issues/9)).

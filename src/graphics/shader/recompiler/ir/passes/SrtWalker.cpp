@@ -223,11 +223,13 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
-		if (m_type == RuntimeValueType::ImmutableInteger &&
-		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
-		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
-		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
-		     SharedAccessOf(op) != SharedAccess::None)) {
+		if ((m_type == RuntimeValueType::ImmutableInteger &&
+		     AddressOpcodeInfoOf(op).access != AddressAccess::None) ||
+		    ((m_type == RuntimeValueType::ImmutableInteger ||
+		      m_type == RuntimeValueType::StorageImmutableInteger) &&
+		     (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		      ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+		      SharedAccessOf(op) != SharedAccess::None))) {
 			return finish(false);
 		}
 		if (op == ValueOpcode::ReadConst) {
