@@ -288,7 +288,11 @@ private:
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
-				return finish(false);
+				// The host can follow a branch on a uniform runtime condition; extraction
+				// turns such a Phi into a select.
+				const auto branch = ResolveBranchPhi(value);
+				return finish(!branch.condition.IsEmpty() && Validate(branch.condition) &&
+				              Validate(branch.if_true) && Validate(branch.if_false));
 			}
 			return finish(Validate(invariant));
 		}

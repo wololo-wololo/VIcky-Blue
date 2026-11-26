@@ -792,6 +792,14 @@ bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
                                const DescriptorSource::IndirectDescriptor& right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
+// A two-way Phi that merges a conditional skip (if-then) or the two arms of an if-else selects
+// between its operands on that branch's condition. The condition is empty for any other value.
+struct BranchPhi {
+	Value condition;
+	Value if_true;
+	Value if_false;
+};
+BranchPhi ResolveBranchPhi(Value value);
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
