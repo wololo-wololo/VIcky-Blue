@@ -814,7 +814,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	// Only a program that can loop pays for the budget: the dispatcher form is one loop, the
 	// structured form loops where a block is a loop header.
-	if (LoopCap() != 0 &&
+	// KYTY_LOOP_CAP_SHADER=<hash hex> limits the cap to one shader, so only its SPIR-V changes.
+	static const uint64_t capped_shader = [] {
+		const char* text = std::getenv("KYTY_LOOP_CAP_SHADER");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+	}();
+	if (LoopCap() != 0 && (capped_shader == 0 || capped_shader == state.program.shader_hash) &&
 	    (dispatcher.has_value() ||
 	     std::ranges::any_of(state.program.blocks, [](const IR::Block* block) {
 		     return block->terminator.loop_header;

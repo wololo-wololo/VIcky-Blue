@@ -144,6 +144,8 @@ private:
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
+	uint64_t                                          m_frame = 0; // Frames, for the DCC experiment.
+	uint64_t                                          m_dcc_frame = ~uint64_t {0};
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;
 	std::vector<uint32_t>                             m_scratch;

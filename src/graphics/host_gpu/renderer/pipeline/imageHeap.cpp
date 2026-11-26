@@ -11,6 +11,13 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 
+#include <functional>
+#include <vector>
+#include <map>
+#include <filesystem>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <iterator>
@@ -495,8 +502,66 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	}
 }
 
+namespace {
+
+// Debug aid (KYTY_HEAP_STATS): where Rebind spends its time, reported every 4096 calls.
+struct RebindStats {
+	using Clock = std::chrono::steady_clock;
+	bool              enabled = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	uint64_t          calls = 0, dcc = 0, held = 0, held_runs = 0, pending = 0, changes = 0;
+	uint64_t          elements = 0, stale_calls = 0;
+	Clock::duration   t_changes {}, t_dcc {}, t_held {}, t_repoint {}, t_pending {}, t_write {};
+	Clock::time_point mark;
+	void Start() { if (enabled) mark = Clock::now(); }
+	void Lap(Clock::duration& into) {
+		if (!enabled) return;
+		const auto now = Clock::now();
+		into += now - mark;
+		mark = now;
+	}
+	// Experiment: with the file dcc_once.flag in the working directory, the DCC elements are
+	// re-resolved on the first Rebind of a frame only. Checked every 4096 calls, so one boot can
+	// compare both behaviours.
+	bool dcc_once = false;
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> gone; // address -> (size, count)
+	void Report() {
+		if (!enabled || ++calls % 4096u != 0u) return;
+		dcc_once = std::filesystem::exists("dcc_once.flag");
+		const auto ms = [](Clock::duration d) {
+			return std::chrono::duration<double, std::milli>(d).count();
+		};
+		std::fprintf(stderr,
+		             "heap stats: calls=4096 elements=%llu changes=%llu dcc=%llu held=%llu/%llu runs "
+		             "pending=%llu stale_calls=%llu | ms changes=%.0f dcc=%.0f held=%.0f repoint=%.0f "
+		             "pending=%.0f write=%.0f dcc_once=%d\n",
+		             static_cast<unsigned long long>(elements), static_cast<unsigned long long>(changes),
+		             static_cast<unsigned long long>(dcc), static_cast<unsigned long long>(held),
+		             static_cast<unsigned long long>(held_runs), static_cast<unsigned long long>(pending),
+		             static_cast<unsigned long long>(stale_calls), ms(t_changes), ms(t_dcc), ms(t_held),
+		             ms(t_repoint), ms(t_pending), ms(t_write), int(dcc_once));
+		std::vector<std::pair<uint64_t, uint64_t>> top; // (count, address)
+		for (const auto& [address, entry]: gone) top.emplace_back(entry.second, address);
+		std::ranges::sort(top, std::greater<>());
+		std::fprintf(stderr, "heap churn: %zu addresses left the cache;", gone.size());
+		for (size_t i = 0; i < top.size() && i < 6; ++i) {
+			std::fprintf(stderr, " 0x%llx+0x%llx x%llu",
+			             static_cast<unsigned long long>(top[i].second),
+			             static_cast<unsigned long long>(gone[top[i].second].first),
+			             static_cast<unsigned long long>(top[i].first));
+		}
+		std::fprintf(stderr, "\n");
+		gone.clear();
+		dcc = held = held_runs = pending = changes = stale_calls = 0;
+		t_changes = t_dcc = t_held = t_repoint = t_pending = t_write = {};
+	}
+} g_rebind_stats;
+
+} // namespace
+
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
+	auto& stats = g_rebind_stats;
+	stats.Start();
 	auto& textures = m_context.GetTextureCache();
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
@@ -512,7 +577,17 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return static_cast<bool>(id);
 	});
+	stats.changes += m_changes.size();
+	if (stats.enabled) {
+		for (const auto& change: m_changes) {
+			auto& entry = stats.gone[change.data.address];
+			entry.first = change.data.size;
+			++entry.second;
+		}
+	}
+	stats.elements = m_elements.size();
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	stats.Lap(stats.t_changes);
 	const auto resolve = [&](const Element& element) {
 		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
 		return executor.ResolveTexture(resource, element.key.value);
@@ -532,14 +607,27 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		return true;
 	};
 	// Discovery applies the color metadata clears written since the last draw.
-	std::erase_if(m_dcc, retry);
+	if (!stats.dcc_once || m_dcc_frame != m_frame || stale) {
+		m_dcc_frame = m_frame;
+		stats.dcc += m_dcc.size();
+		std::erase_if(m_dcc, retry);
+	}
+	stats.Lap(stats.t_dcc);
 	// Held elements retry once an image is created, such as a render target of their extent.
 	if (const auto serial = Image::serials.load(std::memory_order_relaxed);
 	    m_held_serial != serial) {
 		m_held_serial = serial;
+		stats.held += m_held.size();
+		++stats.held_runs;
 		std::erase_if(m_held, retry);
 	}
-	if (stale) Repoint();
+	stats.Lap(stats.t_held);
+	if (stale) {
+		++stats.stale_calls;
+		Repoint();
+	}
+	stats.Lap(stats.t_repoint);
+	stats.pending += m_pending.size();
 	for (const auto index: m_pending) {
 		if (m_elements[index].refs == 0u) continue;
 		auto binding = resolve(m_elements[index]);
@@ -560,7 +648,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		m_writes.push_back({index, {nullptr, binding.image_view, binding.layout}});
 	}
 	m_pending.clear();
+	stats.Lap(stats.t_pending);
 	WriteDescriptors();
+	stats.Lap(stats.t_write);
+	stats.Report();
 }
 
 void ImageHeap::WriteDescriptors() {
@@ -665,6 +756,7 @@ void ImageHeap::RunGarbageCollector() {
 		return true;
 	});
 	m_suspend_draw = m_draw;
+	++m_frame;
 }
 
 void ImageHeap::Drop(Memory& memory) {
