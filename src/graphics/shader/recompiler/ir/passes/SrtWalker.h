@@ -60,7 +60,9 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
-enum class RuntimeValueType { Any, Integer, ImmutableInteger };
+// ImmutableInteger excludes every memory read; StorageImmutableInteger only the reads which buffer,
+// image or shared-memory writes of the shader can change, as address reads need an address write.
+enum class RuntimeValueType { Any, Integer, ImmutableInteger, StorageImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);

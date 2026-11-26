@@ -85,8 +85,9 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		// tbuffer loads carry their format in the instruction. The descriptor only supplies the
+		// address, so each output component is a formatted X load with a constant format/selector.
 		if (typed) {
-			// A typed load names its format itself, so its element layout is static.
 			return formatted && data_bits == 32u &&
 			       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
 			        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);

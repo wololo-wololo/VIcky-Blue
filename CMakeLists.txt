@@ -781,6 +781,17 @@ add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
+# A compute shader whose resources cannot be tracked is reported with an exception that
+# PipelineCache::GetProgram catches, so the recompiler and the pipeline cache are built with
+# exceptions on wherever they are compiled. clang-cl already enables them.
+if(NOT KYTY_CLANG_CL)
+	file(GLOB_RECURSE kyty_exception_sources
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp")
+	list(APPEND kyty_exception_sources
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp")
+	set_property(SOURCE ${kyty_exception_sources} APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests

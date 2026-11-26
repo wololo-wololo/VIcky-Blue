@@ -7496,6 +7496,147 @@ void TestGpuSelectedFormattedRecordStore() {
   }
 }
 
+// A raw indexed store or 32-bit atomic may pick its descriptor row with a waterfall key that is a masked field of
+// a GPU-written material word. The mask bounds the key, so the access uses the same candidate
+// table as the wider stores.
+void TestGpuKeyedRawIndexedStore() {
+  const auto make = [](bool indexed, bool masked,
+                       ValueOpcode access = ValueOpcode::StoreBufferU32) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    std::array<Value, 4> table_words, selector_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = f.UserData(word);
+      selector_words[word] = f.UserData(4u + word);
+    }
+    const auto table = f.Buffer(table_words);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+    const auto material = f.Emit(ValueOpcode::LoadBufferU32x2,
+        {f.Buffer(selector_words), lane, Value(0u), Value(0u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .component_count = 2u,
+                     .idxen = true}, 0x1c0u));
+    const auto packed = f.Emit(ValueOpcode::CompositeExtractU32x2, {material, Value(1u)});
+    const auto field = masked ? f.Emit(ValueOpcode::BitwiseAnd32, {Value(0xffffffu), packed}) : packed;
+    const auto local = f.Emit(ValueOpcode::SelectU32, {active, field, packed});
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {local, active});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word)
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                       .component_index = word, .component_count = 4u}, 0x1d0u + word * 4u));
+    f.Emit(access, {f.Buffer(words), lane, Value(0u), Value(0u), Value(42u), active},
+        f.AddMemory({.kind = ResourceKind::Buffer, .idxen = indexed, .coherent = true}, 0x1e0u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  for (const auto access : {ValueOpcode::StoreBufferU32, ValueOpcode::BufferAtomicIAdd32,
+                            ValueOpcode::BufferAtomicOr32}) {
+    auto fixture = make(true, true, access);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    uint32_t roots = 0;
+    for (const auto& buffer : plan.info.buffers) {
+      const auto& indirect = plan.descriptor_sources[buffer.source].indirect_descriptor;
+      if (!indirect) continue;
+      Check(indirect->table_scalar && indirect->table_stride == 16u && !indirect->selector &&
+                indirect->table_maximum == 0xffffffu && indirect->key_count.IsEmpty(),
+            "GPU-keyed raw indexed store read its key on the CPU instead of using the V# table");
+      ++roots;
+    }
+    Check(roots == 1u, "GPU-keyed raw indexed access lost its candidate root");
+    uint32_t selections = 0;
+    for (const auto* block : fixture->program.blocks)
+      for (const auto& inst : *block) selections += inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex;
+    Check(selections == 1u, "GPU-keyed raw indexed store has no runtime descriptor selection");
+  }
+  // Without the index flag or a proven key maximum the store keeps the strict requirement.
+  for (const auto access : {ValueOpcode::StoreBufferU32, ValueOpcode::BufferAtomicIAdd32,
+                            ValueOpcode::BufferAtomicOr32}) {
+    CheckFatal([&] { make(false, true, access); }, "not a valid runtime value",
+               "non-indexed raw access accepted a GPU key");
+    CheckFatal([&] { make(true, false, access); }, "not a valid runtime value",
+               "indexed raw access accepted an unbounded GPU key");
+  }
+}
+
+void TestBranchSelectedDescriptorWord() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // A V# word chosen by a scalar branch on a value loaded through the user-data pointer, the
+  // shape a guest uses for an optionally offset base address. Stores and atomics cannot fall
+  // back to a GPU-side descriptor read, so the CPU walk must evaluate the branch itself.
+  const auto make = [](ValueOpcode access, bool address_write = false) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    auto* entry = f.block;
+    auto* offset = f.AddBlock();
+    auto* merge = f.AddBlock();
+    const auto address = f.Address(f.UserData(0u), f.UserData(1u));
+    const auto load = [&](uint32_t byte_offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = byte_offset;
+      return f.Emit(ValueOpcode::LoadAddressU32, {address, Value(0u), Value(0u), Value(true)},
+                    f.AddMemory(memory, pc));
+    };
+    const auto flags = load(0u, 0x10u);
+    const auto chosen = f.Emit(ValueOpcode::BitwiseAnd32, {Value(0x10u), flags});
+    const auto condition = f.Emit(ValueOpcode::INotEqual32, {Value(0u), chosen});
+    const auto length = load(8u, 0x20u);
+    entry->AddBranch(offset);
+    entry->AddBranch(merge);
+    entry->condition = condition;
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = offset, .false_block = merge};
+    if (address_write) {
+      // A global store may rewrite the memory the branch reads while the dispatch runs.
+      f.Emit(ValueOpcode::StoreAddressU32, {address, Value(0u), Value(0u), Value(9u), Value(true)},
+             f.AddMemory({.kind = ResourceKind::Flat, .address_is_full = true}, 0x40u));
+    }
+    f.block = offset;
+    const auto moved = f.Emit(ValueOpcode::IAdd32, {load(4u, 0x30u), f.UserData(2u)});
+    offset->AddBranch(merge);
+    offset->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    f.block = merge;
+    auto& base = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    base.AddPhiOperand(entry, Value(0u));
+    base.AddPhiOperand(offset, moved);
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    f.Emit(access, {f.Buffer({Value(&base), f.UserData(3u), length, Value(0x16204u)}),
+                    Value(0u), Value(0u), Value(0u), Value(42u), Value(true)},
+           f.AddMemory({.kind = ResourceKind::Buffer, .coherent = true}, 0x1e0u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  for (const auto access : {ValueOpcode::StoreBufferU32, ValueOpcode::BufferAtomicIAdd32,
+                            ValueOpcode::BufferAtomicOr32}) {
+    auto fixture = make(access);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    Check(plan.info.buffers.size() == 1u,
+          "branch-selected descriptor word was not tracked");
+    for (const uint32_t flag : {0x10u, 0u}) {
+      constexpr uint32_t table = 0x2000u;
+      LinearTestMemory memory;
+      memory.words[(table - memory.base) / 4u] = flag;
+      memory.words[(table - memory.base) / 4u + 1u] = 0x300u;
+      memory.words[(table - memory.base) / 4u + 2u] = 0x40u;
+      std::array<uint32_t, 8> user_data{table, 0u, 0x10u, 0x5000u};
+      const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                               .read_specialization_memory = ReadLinearTestMemory};
+      FakeGuestMemory fake(ReadLinearTestMemory, &memory);
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.buffers.size() == 1u &&
+                snapshot.buffers[0].dwords[0] == (flag != 0u ? 0x310u : 0u) &&
+                snapshot.buffers[0].dwords[2] == 0x40u,
+            "branch-selected descriptor word did not follow its scalar branch");
+    }
+    CheckFatal([&] { make(access, true); }, "not a valid runtime value",
+               "branch read through memory a global store may rewrite was accepted");
+  }
+}
+
 void TestFiniteBufferSelection() {
   enum class Variant { Valid, WiderExec, Unbounded, Cycle, TooMany };
   const auto make = [](Variant variant) {
@@ -9479,6 +9620,8 @@ void TestMalformedMemoryKindsRejected() {
 } // namespace
 
 int main() {
+  // The fork's default-sampler fallback would hide the rejections these tests check.
+  SetStrictSamplerTracking(true);
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9533,6 +9676,8 @@ int main() {
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
+    Run("GPU-keyed raw indexed store", TestGpuKeyedRawIndexedStore);
+    Run("branch-selected descriptor word", TestBranchSelectedDescriptorWord);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
