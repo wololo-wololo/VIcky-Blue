@@ -29,6 +29,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
+// A table scan reads every row once but binds only its distinct descriptors, so it may be longer.
+constexpr uint32_t MaxIndirectTableRows = 1u << 19u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,

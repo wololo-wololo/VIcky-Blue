@@ -14084,6 +14084,54 @@ public:
         }
       }
 
+      // A shader that specialized once can meet a table that no longer does, because the guest
+      // rewrote a row. That dispatch is skipped; it must neither abort the title nor condemn
+      // the shader, whose next dispatch with a usable table still runs.
+      {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(table_shader.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true,
+                             .tgid_y_en = true, .tgid_z_en = true});
+        shaders.SetCsUserSgpr(0, static_cast<u32>(parameters));
+        shaders.SetCsUserSgpr(1, static_cast<u32>(parameters >> 32u));
+        const auto write_rows = [&](Prospero::ImageType second_type) {
+          std::array<u32, 74> table{};
+          for (u32 row = 0; row < 2u; row++) {
+            const auto address = base + 0x90000 + row * 0x10000;
+            const auto type = row == 0u ? Prospero::ImageType::kColor2D : second_type;
+            const ShaderTextureResource sharp{{static_cast<u32>(address >> 8u),
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 20u) | (3u << 30u),
+                1u << 14u,
+                DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                    (static_cast<u32>(type) << 28u),
+                0, 0x00700000u, 0, 0}};
+            std::copy_n(sharp.fields, 8, table.begin() + row * 37);
+          }
+          Require(name, "rewritten table refresh",
+                  context.InvalidateMemory(table_address, sizeof(table)),
+                  "the descriptor table escaped its mapped allocation");
+          LibKernel::Memory::WriteBacking(table_address, table.data(), sizeof(table));
+        };
+        const auto dispatch_program = [&] {
+          ShaderComputeInputInfo input{};
+          input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
+          input.workgroup_counts[2] = 2;
+          return context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+        };
+        write_rows(Prospero::ImageType::kColor2D);
+        const auto usable = dispatch_program();
+        Require(name, "usable table before rewrite", usable != nullptr,
+                "the fixture table did not specialize");
+        write_rows(Prospero::ImageType::kColor3D);
+        Require(name, "unusable table skips the dispatch", dispatch_program() == nullptr,
+                "a cached shader whose table no longer specializes still ran");
+        write_rows(Prospero::ImageType::kColor2D);
+        const auto restored = dispatch_program();
+        Require(name, "usable table after rewrite",
+                restored != nullptr && usable != nullptr && restored->id == usable->id,
+                "one unusable table permanently skipped the shader");
+      }
+
       // GPU-written dispatch counts bound the stride12 selector prefix; only
       // those keys select the two real descriptor members in each stride192 row.
       constexpr auto record_args = base + 0xd0000;
@@ -45730,27 +45778,52 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
   const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
                             .limits.minStorageBufferOffsetAlignment;
   const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
-  for (const bool wide : {false, true})
+  // Modes: signed bytes, RGBA16 float records, unsigned halfwords, and unsigned halfwords in
+  // records wider than the format.
+  for (const u32 mode : {0u, 1u, 2u, 3u, 4u, 5u})
   for (const u32 wave : {32u, 64u}) {
+    // Mode 5 stores one dword to a four-component float record, which zero-fills the rest.
+    const bool rgba32 = mode == 5u;
+    const bool wide = mode == 1u, half = mode == 2u || mode == 3u;
+    const u32 half_stride = mode == 3u ? 12u : 2u;
+    const u32 byte_stride = mode == 4u ? 12u : 1u;
     const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
     const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
     TestCase test;
-    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
+    test.name = wide ? "GpuSelectedFormattedRgba16Store"
+                : mode == 3u ? "GpuSelectedFormattedStridedUInt16Store"
+                : mode == 4u ? "GpuSelectedFormattedStridedRecordStore"
+                : rgba32 ? "GpuSelectedFormattedRgba32DwordStore"
+                : half ? "GpuSelectedFormattedUInt16Store" : "GpuSelectedFormattedRecordStore";
     test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
     auto bytes = std::as_writable_bytes(std::span(test.initial));
     if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
     for (u32 row = 0; row < 6u; ++row) {
       if (wide && row != 0u && row != 3u) continue;
-      const std::array descriptor{slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
+      const std::array descriptor{slot * (row + 1u),
+          (wide ? 8u : rgba32 ? 16u : half ? half_stride : byte_stride) << 16u, 20u,
           wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7)
-               : (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+          : rgba32 ? (u32(Prospero::BufferFormat::k32_32_32_32Float) << 12u) | DstSel(4, 5, 6, 7)
+               : (u32(half ? Prospero::BufferFormat::k16UInt : Prospero::BufferFormat::k8SInt) << 12u) |
+                     DstSel(4, 0, 0, 0)};
       std::copy(descriptor.begin(), descriptor.end(),
                 test.initial.begin() + (table + (wide ? row * 16u : row * stride + member)) / 4u);
       for (u32 element = 0; element < 20u; ++element) {
         if (wide) {
           test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
           test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] = 0x38003400u;
-        } else bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
+        } else if (rgba32) {
+          // x is a normal float; the other channels must be zeroed by a store.
+          const auto record = slot * (row + 1u) / 4u + element * 4u;
+          test.initial[record] = 0x3f800000u + row * 0x100u + element;
+          test.initial[record + 1u] = 0xdead0001u;
+          test.initial[record + 2u] = 0xdead0002u;
+          test.initial[record + 3u] = 0xdead0003u;
+        } else if (half) {
+          const u32 value = 0x2000u + row * 0x100u + element;
+          bytes[slot * (row + 1u) + element * half_stride] = std::byte(value & 255u);
+          bytes[slot * (row + 1u) + element * half_stride + 1u] = std::byte(value >> 8u);
+        } else bytes[slot * (row + 1u) + element * byte_stride] = std::byte(0x80u + row + element);
       }
     }
     auto records = MakeStructuredStorageBufferData(stride, 6u);
@@ -45800,7 +45873,8 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
         AppendVMovLiteral(&code, vgpr, bits);
     } else {
       code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
-      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+      // Halfwords stay in range, so the check does not depend on how an overflow converts.
+      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), rgba32 ? 0x40000000u : half ? 0x100u : u32(-200)});
     }
     AppendSMovLiteral(&code, 126, 0x55555555u);
     AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
@@ -45826,7 +45900,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
         offset += words.size();
       }
       Require(test.name, "one shared store after the null candidate",
-              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u) * (rgba32 ? 4u : 1u),
               "homogeneous children duplicated the native store per descriptor");
     }
     u32 bda_loads = 0, native_stores = 0;
@@ -45872,12 +45946,23 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
       for (u32 lane = 0; lane < wave; ++lane) {
         const bool valid = wide ? row == 0u || row == 3u : row < 6u;
         test.expected[slot * 7u / 4u + group * wave + lane] =
-            valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
+            valid && lane < 20u ? (wide ? 0x3f800000u
+                                   : rgba32 ? 0x3f800000u + row * 0x100u + lane
+                                   : half ? 0x2000u + row * 0x100u + lane
+                                          : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
         if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
           if (wide) {
             test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
             test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
-          } else expected_bytes[slot * (row + 1u) + lane] =
+          } else if (rgba32) {
+            const auto record = slot * (row + 1u) / 4u + lane * 4u;
+            test.expected[record] = 0x40000000u + lane * 32u;
+            test.expected[record + 1u] = test.expected[record + 2u] = test.expected[record + 3u] = 0u;
+          } else if (half) {
+            const u32 value = lane * 32u + 0x100u;
+            expected_bytes[slot * (row + 1u) + lane * half_stride] = std::byte(value & 255u);
+            expected_bytes[slot * (row + 1u) + lane * half_stride + 1u] = std::byte(value >> 8u);
+          } else expected_bytes[slot * (row + 1u) + lane * byte_stride] =
               std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
         }
       }
