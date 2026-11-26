@@ -6947,6 +6947,28 @@ void TestGuardedWaterfallBufferRecords() {
     Check(!materialize() && memory.reads == 0u, "waterfall accepted an excessive runtime bound");
     user_data[2] = 2u;
   }
+  // Byte rows (UInt8, stride 1) for a formatted load: index bounds are a plain record domain,
+  // but byte bounds stay refused for loads. A read-only record table can hold rows that are not
+  // descriptors, and the byte relaxation for stores would bind them; such a load is left to the
+  // GPU-read path instead.
+  {
+    auto fixture = make(Guard::Exact);
+    const auto plan = ExtractResourcePlan(fixture->program);
+    const auto set_rows = [&](uint32_t oob) {
+      for (uint32_t row = 0; row < 2u; ++row) {
+        const std::array descriptor{0x10000u + row * 0x1000u, 1u << 16u, 32u,
+            (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | DstSel(4, 5, 6, 1) | oob << 28u};
+        std::copy(descriptor.begin(), descriptor.end(),
+                  memory.words.begin() + (table_offset + row * 488u + 216u) / 4u);
+      }
+    };
+    set_rows(0u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "UInt8 stride-1 load candidates with index bounds were refused");
+    set_rows(3u);
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "byte-bounds formatted load candidates were enumerated on the host");
+  }
 }
 
 void TestGpuSelectedBufferRecords() {
