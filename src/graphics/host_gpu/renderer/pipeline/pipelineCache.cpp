@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -455,8 +456,19 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return bind(*module);
 		}
 	}
-	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
-	                          push_data));
+	try {
+		return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
+		                          push_data));
+	} catch (const ShaderRecompiler::IR::UnsupportedShaderInput&) {
+		// TEMPORARY WORKAROUND: a shader that reads a stage input the recompiler cannot provide is
+		// skipped like one whose resources cannot be specialized, instead of ending the run.
+		PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
+		                 "reason=unsupported stage input; rendering is incomplete",
+		                 options.stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW",
+		                 params.hash, static_cast<int>(options.stage));
+		entry->second.skip_dispatch = true;
+		return nullptr;
+	}
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
