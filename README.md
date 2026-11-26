@@ -70,6 +70,16 @@ Known state:
     ([#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3)). The shaders that were skipped
     are large (about 363k SPIR-V words on average, 131 of 195 over 400k), so a first boot takes
     much longer to compile them ([#14](https://github.com/wololo-wololo/VIcky-Blue/issues/14)).
+  - Indirect buffer tables of up to 524288 rows now specialize, stride-one byte-bounds
+    descriptors are accepted as candidates for one-byte formats (SInt8 and UInt8 stores), and a
+    cached program whose descriptors later stop specializing is skipped with a log line instead
+    of aborting. Two of the shaders named in
+    [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3) are still skipped; the remaining
+    reasons are atomic image formats ([#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)),
+    formatted stores on wider strides, and pointer-table probes that read unmapped rows. A run
+    with these changes stayed in the intro for eight minutes without a guest fault; an earlier
+    version of the byte-bounds change let 2- and 4-byte formats address unaligned words and ended
+    the title with an audio decoder fault after two to three minutes.
 - Two system library functions the title calls are not implemented yet
   ([#5](https://github.com/wololo-wololo/VIcky-Blue/issues/5), [#6](https://github.com/wololo-wololo/VIcky-Blue/issues/6)).
 - The title needs `KYTY_LARGE_MEMORY=1` set to get enough guest memory ([#9](https://github.com/wololo-wololo/VIcky-Blue/issues/9)).

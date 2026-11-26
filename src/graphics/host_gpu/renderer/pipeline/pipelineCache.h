@@ -221,12 +221,17 @@ private:
 		// Set when candidate enumeration failed and the shader was translated again with
 		// table-selected buffer descriptors read on the GPU; later translations must match.
 		bool                                         gpu_table_descriptors = false;
+		// Set once a dispatch was skipped because the program no longer specialized.
+		bool                                         respecialization_reported = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		// Returns the module matching the current resources, or null. `specialized` is false
+		// when the resources no longer specialize at all (the guest rewrote a descriptor table).
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         ShaderRecompiler::IR::PushData::Window  push_data);
+		                         ShaderRecompiler::IR::PushData::Window  push_data,
+		                         bool&                                   specialized);
 	};
 
 	struct ProgramKey {
@@ -268,6 +273,8 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	static const ShaderModule* SkipRespecialization(Program& program, uint64_t hash,
+	                                                ShaderType stage);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions       options,
 	                            ShaderRecompiler::TranslateResult      translated,
