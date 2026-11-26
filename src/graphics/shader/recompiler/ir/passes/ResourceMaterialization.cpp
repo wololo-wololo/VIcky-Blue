@@ -995,8 +995,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		// Atomics work on the raw texel bits, so a float format of the same width is as good.
 		if (base.atomic &&
-		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt &&
+		                         format != Prospero::BufferFormat::k32_32Float
 		                   : format != Prospero::BufferFormat::k32UInt &&
 		                         format != Prospero::BufferFormat::k32SInt &&
 		                         format != Prospero::BufferFormat::k32Float)) {

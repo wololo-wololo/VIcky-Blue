@@ -1549,6 +1549,8 @@ struct TestCase {
   std::vector<u32> expected_storage_image_rgba;
   vk::Format storage_image_format = vk::Format::eR32G32B32A32Sfloat;
   u32 storage_image_dwords_per_pixel = 4;
+  // Format of the image the 64-bit atomic view is taken from; eUndefined means R32G32Uint.
+  vk::Format storage_image_atomic64_format = vk::Format::eUndefined;
   std::vector<u32> storage_image_r32ui;
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
@@ -25527,7 +25529,9 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vk::ImageLayout::eGeneral);
     storage_image_uint = vulkan->CreateImage2D(
         test.name, test.image_width, test.image_height,
-        atomic64 ? vk::Format::eR32G32Uint : vk::Format::eR32Uint,
+        !atomic64 ? vk::Format::eR32Uint
+        : test.storage_image_atomic64_format != vk::Format::eUndefined
+            ? test.storage_image_atomic64_format : vk::Format::eR32G32Uint,
         vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, atomic64 ? 2 : 1,
         vk::ImageLayout::eGeneral,
         atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
@@ -49167,12 +49171,16 @@ constexpr ImageAtomicIntegerCase ImageAtomicIntegerCases[] = {
      {0xfffffffeu, 0xfffffffeu, 0xffffffffu, 0xfffffffeu, 0xffffffffu}},
 };
 
-TestCase ImageAtomicIntegerGlcAndExec(const ImageAtomicIntegerCase &atomic, bool wide) {
+// float_image runs the 64-bit atomic on a two-channel float image: atomics use the raw texel bits.
+TestCase ImageAtomicIntegerGlcAndExec(const ImageAtomicIntegerCase &atomic, bool wide,
+                                      bool float_image = false) {
   const u32 texel_dwords = wide ? 2 : 1;
   TestCase test;
-  test.name = wide ? atomic.name64 : atomic.name32;
-  test.user_data = MakeStorageTextureData(wide ? Prospero::BufferFormat::k32_32UInt
-                                              : Prospero::BufferFormat::k32UInt);
+  test.name = float_image ? "ImageAtomic64OnFloatImage" : wide ? atomic.name64 : atomic.name32;
+  test.user_data = MakeStorageTextureData(float_image ? Prospero::BufferFormat::k32_32Float
+                                          : wide ? Prospero::BufferFormat::k32_32UInt
+                                                 : Prospero::BufferFormat::k32UInt);
+  if (float_image) test.storage_image_atomic64_format = vk::Format::eR32G32Sfloat;
   test.has_user_data = true;
   test.storage_image_r32ui.assign(16 * texel_dwords, 0);
   test.expected_storage_image_r32ui = test.storage_image_r32ui;
@@ -50874,6 +50882,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, false));
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, true));
   }
+  // IMAGE_ATOMIC_UMAX: the target title's 64-bit depth-and-colour maximum.
+  cases.push_back(ImageAtomicIntegerGlcAndExec(ImageAtomicIntegerCases[3], true, true));
   AddCase(ImageAtomicFloatGlcAndExec<true>);
   AddCase(ImageAtomicFloatGlcAndExec<false>);
   AddCase(ImageAtomicFloatSpecialValues<true>);
@@ -58905,6 +58915,7 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, false));
       RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, true));
     }
+    RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(ImageAtomicIntegerCases[3], true, true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-ordered-count-only") == 0) {
