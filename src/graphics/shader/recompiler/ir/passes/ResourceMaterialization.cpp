@@ -996,8 +996,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		// The host only has 32-bit and 64-bit image atomics. Narrower unsigned texels are loaded,
+		// combined and stored instead: not atomic, so two invocations that hit one texel at the
+		// same time can lose an update, but the access is no longer dropped.
+		image.atomic_rmw = base.atomic && !base.atomic64 &&
+		                   (format == Prospero::BufferFormat::k8UInt ||
+		                    format == Prospero::BufferFormat::k16UInt);
 		// Atomics work on the raw texel bits, so a float format of the same width is as good.
-		if (base.atomic &&
+		if (base.atomic && !image.atomic_rmw &&
 		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt &&
 		                         format != Prospero::BufferFormat::k32_32Float
 		                   : format != Prospero::BufferFormat::k32UInt &&
@@ -1668,6 +1674,33 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// Debug aid: KYTY_IMAGE_TRACE=<shader hash, hex> prints every directly bound T# the shader gets,
+// as evaluated and before invalid or unreached ones are replaced by a null image. Each distinct
+// descriptor is printed once.
+static void TraceImageDescriptor(const ResourcePlan& program, uint32_t index,
+                                 const DescriptorValue& value) {
+	static const uint64_t traced = [] {
+		const char* text = std::getenv("KYTY_IMAGE_TRACE");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+	}();
+	if (traced == 0u || traced != program.shader_hash) return;
+	static std::unordered_set<uint64_t> seen;
+	uint64_t key = index;
+	for (const auto word: value.dwords) key = key * 0x9e3779b97f4a7c15ull + word;
+	if (!seen.insert(key).second || seen.size() > 256u) return;
+	const auto& image = program.info.images[index];
+	std::fprintf(stderr,
+	             "image trace: shader=%016llx image=%u source=%u class=%u dim=%u read=%d written=%d "
+	             "atomic=%d r128=%d first_pc=%#x active=%d valid=%d words=%08x,%08x,%08x,%08x,"
+	             "%08x,%08x,%08x,%08x\n",
+	             static_cast<unsigned long long>(program.shader_hash), index, image.source,
+	             static_cast<unsigned>(image.resource_class), static_cast<unsigned>(image.dimension),
+	             image.read, image.written, image.atomic, image.r128, image.first_use_pc,
+	             WalkedImageActive(program, index), ValidImageDescriptor(value, image.r128),
+	             value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], value.dwords[4],
+	             value.dwords[5], value.dwords[6], value.dwords[7]);
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
@@ -1828,6 +1861,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!evaluate(image.source, snapshot.images[i])) {
 				return false;
 			}
+			TraceImageDescriptor(program, i, snapshot.images[i]);
 			// An image listed only by unreached blocks reads zero, not its source's descriptor.
 			if (!WalkedImageActive(program, i) ||
 			    !ValidImageDescriptor(snapshot.images[i], image.r128)) {
@@ -1966,6 +2000,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.cube                       = source.cube;
 		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
+		image.atomic_rmw                 = source.atomic_rmw;
+		if (source.atomic_rmw) image.atomic = false;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

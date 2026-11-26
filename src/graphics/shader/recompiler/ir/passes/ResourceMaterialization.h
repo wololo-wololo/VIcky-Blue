@@ -34,6 +34,7 @@ struct ResourceSpecialization {
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
+		bool                          atomic_rmw                 = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

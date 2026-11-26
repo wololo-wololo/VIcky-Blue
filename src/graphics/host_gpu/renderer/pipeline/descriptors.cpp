@@ -287,7 +287,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const auto swizzle = descriptor.DstSelXYZW();
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
-	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic || resource.atomic_rmw);
 	// A 4.8 fixed-point MIN_LOD at or below BASE_LEVEL clamps no level of the view.
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d || is_2d_msaa) &&
 	       supported_tile && descriptor.BaseLevel() <= descriptor.LastLevel() &&

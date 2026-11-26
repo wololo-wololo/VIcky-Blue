@@ -1134,6 +1134,69 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto dimension = image.dimension;
 		const auto result_type = TypeId(state, inst.GetType());
 		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
+		if (image.atomic_rmw) {
+			// No host atomics for this texel format: load, combine, store. See ImageResource.
+			state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+			ctx.Define(inst, EmitValueOrDefaultIfCondition(
+			                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
+				const auto coord      = CoordU32(ctx, mem, *address, dimension);
+				const auto descriptor = LoadImageDescriptor(state, mem.resource, 0, 0);
+				const auto texel      = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpImageRead, TypeU32Vector(state, 4), texel,
+				                          descriptor, coord);
+				const auto old = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), old, texel, 0u);
+				const auto binary = [&](spv::Op opcode, uint32_t lhs, uint32_t rhs) {
+					const auto id = state.builder.AllocateId();
+					state.builder.AddFunction(opcode, TypeU32(state), id, lhs, rhs);
+					return id;
+				};
+				uint32_t next = 0;
+				if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
+				    op == IR::ValueOpcode::ImageAtomicFMax32) {
+					next = EmitFloatAtomicReplacement(state, old, ctx.Arg(inst, 2),
+					                                  op == IR::ValueOpcode::ImageAtomicFMax32);
+				} else {
+					const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+					switch (SpirvAtomicOpcode(op)) {
+						case spv::OpAtomicExchange: next = value; break;
+						case spv::OpAtomicIAdd: next = binary(spv::OpIAdd, old, value); break;
+						case spv::OpAtomicISub: next = binary(spv::OpISub, old, value); break;
+						case spv::OpAtomicAnd: next = binary(spv::OpBitwiseAnd, old, value); break;
+						case spv::OpAtomicOr: next = binary(spv::OpBitwiseOr, old, value); break;
+						case spv::OpAtomicXor: next = binary(spv::OpBitwiseXor, old, value); break;
+						case spv::OpAtomicUMin:
+							next = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, old, value);
+							break;
+						case spv::OpAtomicUMax:
+							next = EmitGlsl<GLSLstd450UMax, IR::Type::U32>(state, old, value);
+							break;
+						case spv::OpAtomicSMin:
+							next = EmitGlsl<GLSLstd450SMin, IR::Type::U32>(state, old, value);
+							break;
+						case spv::OpAtomicSMax:
+							next = EmitGlsl<GLSLstd450SMax, IR::Type::U32>(state, old, value);
+							break;
+						case spv::OpAtomicCompareExchange: {
+							const auto equal = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpIEqual, TypeBool(state), equal, old, value);
+							const auto id = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpSelect, TypeU32(state), id, equal,
+							                          ctx.Arg(inst, inst.NumArgs() - 3), old);
+							next = id;
+							break;
+						}
+						default: ctx.Fail(inst, "has no load-and-store form for this image atomic");
+					}
+				}
+				const auto stored = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), stored,
+				                          next, zero, zero, zero);
+				EmitStorageImageWrite(state, mem.resource, 0, coord, stored, 0, 0);
+				return old;
+			}));
+			return;
+		}
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
 		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
 			           const auto pointer      = state.builder.AllocateId();

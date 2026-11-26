@@ -170,6 +170,9 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
+	// The descriptor's format has no host image atomics: its atomics load, combine and store
+	// instead, and the image binds like any other unsigned storage image (atomic is cleared).
+	bool                          atomic_rmw        = false;
 	bool                          unfiltered_access_only = true;
 	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
