@@ -58083,11 +58083,6 @@ static int ReplayCapturedShaders(const char *folder) {
       skipped++;
       continue;
     }
-    if (!shader.has_compute) {
-      // Only compute captures carry their stage input.
-      skipped++;
-      continue;
-    }
     ShaderRecompiler::CompileOptions options;
     options.stage = static_cast<ShaderType>(shader.header.stage);
     options.wave_size = shader.header.wave_size;
@@ -58096,6 +58091,20 @@ static int ReplayCapturedShaders(const char *folder) {
     options.dump_ir = false;
     options.user_data = shader.user_data;
     options.back_code = shader.back_code;
+    if (!shader.has_compute) {
+      // Only compute captures carry their stage input; the others can still be listed.
+      skipped++;
+      if (std::getenv("KYTY_REPLAY_LISTINGS") != nullptr) {
+        try {
+          auto listing = entry.path();
+          listing.replace_extension(".asm.txt");
+          std::ofstream(listing) << ShaderRecompiler::Decoder::ProgramToString(
+              ShaderRecompiler::PrepareShaderSource(shader.code, options).decoded);
+        } catch (const ShaderRecompiler::IR::UnsupportedComputeShader &) {
+        }
+      }
+      continue;
+    }
     options.input_info.compute = &shader.compute;
     try {
       const auto source =
