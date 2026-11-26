@@ -5,6 +5,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Thrown when a shader reads a stage input the recompiler cannot provide, so the draws that use it
+// can be skipped.
+struct UnsupportedShaderInput {};
+
 // Collects the shader interface, resource usage and instruction features after resource tracking.
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
 

@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 
@@ -436,7 +437,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			const auto component = inst.Arg(1).U32();
 			switch (kind) {
 				case StageInputKind::PackedAncillary:
-					return Fail("packed pixel ancillary input has an unsupported live use");
+					std::fprintf(stderr, "shader info collection: hash=0x%016llx packed pixel ancillary "
+					             "input has an unsupported live use\n",
+					             static_cast<unsigned long long>(program.shader_hash));
+					throw UnsupportedShaderInput {};
 				case StageInputKind::Layer:
 				case StageInputKind::SampleId:
 					if (program.stage != ShaderType::Pixel || component != 0u) {
