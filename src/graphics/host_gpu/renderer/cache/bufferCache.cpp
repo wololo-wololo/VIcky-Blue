@@ -643,6 +643,8 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 }
 
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	// Resident image heaps re-resolve their DCC elements when their metadata changes.
+	m_scheduler.Context().GetImageHeap().NoteMetadataWrite(vaddr, size);
 	for (auto& checked: m_checked_color_metadata) {
 		checked.Subtract(vaddr, size);
 	}
