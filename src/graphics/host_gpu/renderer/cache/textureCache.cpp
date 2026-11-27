@@ -117,6 +117,20 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	return true;
 }
 
+// KYTY_HEAP_STATS reports: one image description per line entry.
+std::string DescribeImageInfo(const ImageInfo& info) {
+	char text[192];
+	std::snprintf(text, sizeof(text),
+	              "0x%" PRIx64 "+0x%" PRIx64 " fmt=%u/%u type=%u %ux%ux%u lv=%u ly=%u tile=%u",
+	              info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
+	              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+	              info.extent.width, info.extent.height, info.extent.depth,
+	              static_cast<uint32_t>(info.resources.levels),
+	              static_cast<uint32_t>(info.resources.layers),
+	              static_cast<uint32_t>(info.tile_mode));
+	return std::string(text);
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -285,18 +299,7 @@ void TextureCache::FreeImage(ImageId id, const char* reason) {
 	static const bool heap_stats = std::getenv("KYTY_HEAP_STATS") != nullptr;
 	if (const auto& image = m_slot_images[id];
 	    heap_stats && image.registered && image.heap_refs.load(std::memory_order_relaxed) != 0u) {
-		const auto describe = [](const ImageInfo& info) {
-			char text[192];
-			std::snprintf(text, sizeof(text),
-			              "0x%" PRIx64 "+0x%" PRIx64 " fmt=%u/%u type=%u %ux%ux%u lv=%u ly=%u tile=%u",
-			              info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
-			              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
-			              info.extent.width, info.extent.height, info.extent.depth,
-			              static_cast<uint32_t>(info.resources.levels),
-			              static_cast<uint32_t>(info.resources.layers),
-			              static_cast<uint32_t>(info.tile_mode));
-			return std::string(text);
-		};
+		const auto describe = DescribeImageInfo;
 		std::string key = std::string(reason) + " refs=" +
 		                  std::to_string(image.heap_refs.load(std::memory_order_relaxed)) + " freed " +
 		                  describe(image.info);
@@ -584,6 +587,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
+		m_copy_path = source.info.data == destination.info.data ? "buffer-modified" : "skipped";
 		return;
 	}
 	const bool source_depth = source.info.IsDepth();
@@ -598,13 +602,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	      CanCopyAspectToColor(source_depth ? source.backing.format : destination.backing.format,
 	                           source_depth ? destination.backing.format : source.backing.format)));
 	if (direct_copy) {
+		m_copy_path = "direct";
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
+		m_copy_path = "buffer";
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
+	} else {
+		m_copy_path = "d16";
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -696,6 +704,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	static const bool heap_stats = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	// Read before RefreshImage, which may download or upload the cached image.
+	const bool cached_gpu_modified    = cached.IsGpuModified();
+	const bool cached_buffer_modified = cached.IsBufferModified();
+	const bool cached_cpu_dirty       = cached.IsDefinitelyCpuDirty();
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -719,10 +732,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.binding.needs_rebind = true;
 	}
 	// The copy below covers only the cached layers and levels; the rest start from guest memory.
-	if (info.resources.levels > cached.info.resources.levels ||
-	    info.resources.layers > cached.info.resources.layers) {
+	const bool initialized = info.resources.levels > cached.info.resources.levels ||
+	                         info.resources.layers > cached.info.resources.layers;
+	if (initialized) {
 		InitializeImage(replacement_id);
 	}
+	m_copy_path = "none";
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
@@ -753,6 +768,20 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
 			metadata->second.owner = replacement_id;
 		}
+	}
+	if (heap_stats) {
+		// KYTY_HEAP_STATS: every depth<->color replacement, keyed by what it lost or kept.
+		std::string key = "binding=" + std::to_string(static_cast<uint32_t>(binding)) +
+		                  (m_find_desc != nullptr && m_find_desc->heap ? " heap" : "") +
+		                  " cached{" + DescribeImageInfo(cached.info) +
+		                  (cached_gpu_modified ? " gpu" : "") +
+		                  (cached_buffer_modified ? " buf" : "") +
+		                  (cached_cpu_dirty ? " cpu" : "") + " refs=" +
+		                  std::to_string(cached.heap_refs.load(std::memory_order_relaxed)) +
+		                  "} -> new{" + DescribeImageInfo(info) + "} copy=" + m_copy_path +
+		                  (initialized ? " init-from-guest" : "") +
+		                  (replacement.IsGpuModified() ? " new-gpu" : "");
+		++m_depth_replaces[key];
 	}
 	FreeImage(cached_id, "depth-replace");
 	return replacement_id;
@@ -2253,6 +2282,23 @@ void TextureCache::RunGarbageCollector() {
 			std::fprintf(stderr, "heap frees:   x%" PRIu64 " %s\n", top[i].first, top[i].second->c_str());
 		}
 		m_heap_frees.clear();
+	}
+	if (!m_depth_replaces.empty() && tick % 64u == 0u) {
+		// KYTY_HEAP_STATS: depth<->color replacements in the last 64 frames, most frequent first.
+		std::vector<std::pair<uint64_t, const std::string*>> top;
+		uint64_t                                             total = 0;
+		for (const auto& [key, count]: m_depth_replaces) {
+			top.emplace_back(count, &key);
+			total += count;
+		}
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::fprintf(stderr, "depth replaces: %" PRIu64 " in 64 frames, %zu kinds\n", total,
+		             top.size());
+		for (size_t i = 0; i < top.size() && i < 12u; i++) {
+			std::fprintf(stderr, "depth replaces:   x%" PRIu64 " %s\n", top[i].first,
+			             top[i].second->c_str());
+		}
+		m_depth_replaces.clear();
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

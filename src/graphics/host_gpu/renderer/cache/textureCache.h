@@ -292,6 +292,8 @@ private:
 	// counted per call site, freed image and requesting descriptor; reported by the collector.
 	const ImageDesc*                                  m_find_desc = nullptr; // During FindImage.
 	std::map<std::string, uint64_t>                   m_heap_frees;
+	std::map<std::string, uint64_t>                   m_depth_replaces;
+	const char*                                       m_copy_path = "none"; // Last CopyImage path.
 	// Ranges of images whose first GPU write left a heap-selected clean BC alias behind.
 	std::vector<GuestRange>                           m_bc_alias_writes;
 	std::mutex                                        m_write_back_mutex;
