@@ -27,6 +27,14 @@ uint32_t LoopCap() {
 	return cap;
 }
 
+bool PreciseWrites() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_PRECISE_WRITES");
+		return text != nullptr && std::strtoul(text, nullptr, 0) != 0u;
+	}();
+	return enabled;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   IR::PushData::Window push_data, const Profile& profile,
                                   bool emit_debug_info) {

@@ -34,6 +34,7 @@ uint32_t StackPush(EmitterState& s, const MemoryResourceAccess& memory,
 	const auto count = Bits(s, control, 0, 5), parent = Bits(s, control, 5, 5), ring = Bits(s, control, 10, 5);
 	const auto index = StackIndex(s, control, ring);
 	EmitIfCondition(s, EmitMemoryElementInBounds(s, memory, index), [&] {
+		MarkBufferWrite(s, memory, index, memory.element_bits / 8u);
 		s.builder.AddFunction(spv::OpStore, EmitMemoryElementPointer(s, memory, index), node);
 	});
 	control = Binary(s, spv::OpBitwiseOr, u, control,

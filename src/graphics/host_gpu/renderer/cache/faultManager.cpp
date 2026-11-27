@@ -20,13 +20,31 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
+constexpr size_t MaxPageFaults    = FaultManager::MaxPageFaults;
 // The bitmap holds a fault bit per cache page, then a bit per page a shader stored to through its
-// device address (see StoreBda in the SPIR-V emitter).
-constexpr uint64_t FaultBitmapPages = BufferCache::CACHING_NUMPAGES * 2;
+// device address (see StoreBda in the SPIR-V emitter), then a bit per page a shader stored to
+// through a buffer binding (KYTY_PRECISE_WRITES, see MarkBufferWrite).
+constexpr uint64_t FaultBitmapPages = BufferCache::CACHING_NUMPAGES * 3;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr uint64_t WrittenBase      = BufferCache::CACHING_NUMPAGES << BufferCache::CACHING_PAGEBITS;
 
 } // namespace
+
+uint64_t WrittenPageAddress(uint64_t record) {
+	if (record < WrittenBase) return 0;
+	const auto offset = record < 2 * WrittenBase ? record - WrittenBase : record - 2 * WrittenBase;
+	return BufferCache::GuestAddress(offset);
+}
+
+const uint64_t* FaultManager::AreaRecords(uint32_t area, uint64_t& count, bool& overflow) {
+	const auto offset = area * PageFaultAreaSize;
+	m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+	const auto* records = std::bit_cast<const uint64_t*>(m_download_buffer.Mapped().data() + offset);
+	// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
+	count    = std::min<uint64_t>(records[0], MaxPageFaults - 1);
+	overflow = records[0] > count;
+	return records;
+}
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
@@ -122,14 +140,14 @@ void FaultManager::ProcessFaultBuffer() {
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+	m_scheduler.DeferOperation([this, area] {
 		RangeSet    fault_ranges;
 		RangeSet    written_ranges;
-		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
-		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
-		if (faults[0] > count) {
+		RangeSet    binding_ranges;
+		uint64_t    count    = 0;
+		bool        overflow = false;
+		const auto* faults   = AreaRecords(area, count, overflow);
+		if (overflow) {
 			static std::atomic<uint32_t> reported {0};
 			if (reported.fetch_add(1) < 16) {
 				std::fprintf(stderr, "fault buffer overflow: %llu page records, %llu kept\n",
@@ -138,11 +156,12 @@ void FaultManager::ProcessFaultBuffer() {
 			}
 		}
 		for (uint32_t index = 1; index <= count; ++index) {
-			constexpr uint64_t written_base = BufferCache::CACHING_NUMPAGES
-			                                  << BufferCache::CACHING_PAGEBITS;
-			if (faults[index] >= written_base) {
-				written_ranges.Add(BufferCache::GuestAddress(faults[index] - written_base),
-				                   BufferCache::CACHING_PAGESIZE);
+			if (faults[index] >= 2 * WrittenBase) {
+				binding_ranges.Add(WrittenPageAddress(faults[index]), BufferCache::CACHING_PAGESIZE);
+				continue;
+			}
+			if (faults[index] >= WrittenBase) {
+				written_ranges.Add(WrittenPageAddress(faults[index]), BufferCache::CACHING_PAGESIZE);
 				continue;
 			}
 			const auto address = BufferCache::GuestAddress(faults[index]);
@@ -156,6 +175,10 @@ void FaultManager::ProcessFaultBuffer() {
 		// Stores through device addresses reach no binding: hand their pages to the cache now.
 		written_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.MarkGpuWritten(start, end - start);
+		});
+		// Stores through bindings already marked their ranges; they confirm the pages hold GPU data.
+		binding_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.NoteScannedWrite(start, end - start);
 		});
 		m_fault_areas[area] = 0;
 	});

@@ -401,6 +401,8 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+// Loads the shader data dword at a SPIR-V index id, which already includes the push data start.
+uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index);
 uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -424,6 +426,11 @@ struct MemoryResourceAccess {
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
+
+// With Bindings::write_pages, records the guest cache page of a store to element `index` of a
+// buffer binding in the written-binding region of the fault bitmap. Other resource kinds emit nothing.
+void MarkBufferWrite(EmitterState& state, const MemoryResourceAccess& resource, uint32_t index,
+                     uint32_t element_bytes);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);

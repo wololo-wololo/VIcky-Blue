@@ -54,15 +54,20 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// The span a readback widens to (a power of two); returns the previous one. For tests.
+	static uint64_t        SetDownloadWindow(uint64_t bytes) noexcept;
 	// Ends the draw window, whose draws share the stream copies of CPU-written ranges.
 	void                   EndDrawWindow() noexcept { m_draw_window++; }
 	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// precise_writes: a storage-buffer binding of a shader that records the pages it stores to
+	// (KYTY_PRECISE_WRITES), so pages it leaves untouched can drop the GPU-modified marking.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        BufferId id              = {},
+	                                                        bool     precise_writes  = false);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -92,6 +97,8 @@ public:
 	void               ProcessFaultBuffer();
 	// Pages a shader wrote through device addresses, reported after the dispatch ran.
 	void               MarkGpuWritten(uint64_t vaddr, uint64_t size);
+	// Pages a fault-buffer scan reported as stored to, through a binding or a device address.
+	void               NoteScannedWrite(uint64_t vaddr, uint64_t size);
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
@@ -100,6 +107,10 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+
+	// KYTY_PRECISE_WRITES: before a readback of [vaddr, vaddr + size), scans the written pages
+	// and drops the GPU-modified marking of recorded precise bindings' bytes no store reached.
+	void ResolvePreciseWrites(uint64_t vaddr, uint64_t size);
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
 
@@ -161,6 +172,16 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// KYTY_PRECISE_WRITES bookkeeping. Precise bindings of the current draw window (their
+	// commands may not be recorded yet), of earlier windows (recorded, unresolved), and the
+	// GPU-modified bytes some writer is known to have written, kept until they are downloaded.
+	RangeSet                                          m_precise_open;
+	uint64_t                                          m_precise_open_window = 0;
+	RangeSet                                          m_precise_recorded;
+	RangeSet                                          m_gpu_confirmed;
+	// KYTY_PRECISE_WRITES=2: bytes resolution found untouched but left marked, to check that
+	// their downloads change nothing.
+	RangeSet                                          m_predicted_clean;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;

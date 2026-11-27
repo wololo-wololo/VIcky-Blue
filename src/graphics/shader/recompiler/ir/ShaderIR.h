@@ -526,6 +526,9 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
+	// The shader writes a buffer binding: each store also records its guest page in the written
+	// bitmap, so the host learns which pages of a written binding the GPU changed.
+	bool write_pages = false;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -533,9 +536,16 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// With write_pages, two dwords per binding: the written-bitmap bit of the cache page holding
+	// the binding's first byte (guest page 0 for a null binding), and that byte's offset in it.
+	[[nodiscard]] uint32_t WritePageDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return WritePageDword() +
+		       (write_pages ? 2u * descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)]
+		                    : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

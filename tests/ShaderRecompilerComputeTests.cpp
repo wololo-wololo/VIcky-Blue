@@ -5393,6 +5393,8 @@ public:
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
+    // The readback windows below are laid out for 512 KiB.
+    const auto default_window = BufferCache::SetDownloadWindow(0x80000);
     constexpr uint64_t allocation_size = 0x5000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t first_offset = 0x100;
@@ -6464,6 +6466,7 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    BufferCache::SetDownloadWindow(default_window);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -7125,8 +7128,8 @@ public:
   // The fault scan reports each set page once and leaves the pages past its records set.
   void CheckFaultBufferScan() {
     constexpr const char *name = "FaultBufferScan";
-    constexpr u32 words = 2048;
-    constexpr u32 records = 1024; // Record 0 holds the count.
+    constexpr u32 words = 32768;
+    constexpr u32 records = FaultManager::MaxPageFaults; // Record 0 holds the count.
     const vk::DescriptorSetLayoutBinding bindings[]{
         {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
         {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
@@ -7204,11 +7207,12 @@ public:
               "the scan lost, repeated or kept a reported page");
     };
     // Bits in each word of a block, several in one word, and in the last word.
-    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17, 2047 * 32 + 31});
-    // 1200 pages, two per word, overflow the 1023 records; an odd record count leaves a word
+    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17,
+                    (words - 1) * 32 + 31});
+    // 18000 pages, two per word, overflow the 16383 records; an odd record count leaves a word
     // partly reported.
     std::vector<u32> overflow;
-    for (u32 i = 0; i < 600; i++) {
+    for (u32 i = 0; i < 9000; i++) {
       overflow.push_back((3 * i + 1) * 32 + i % 31);
       overflow.push_back((3 * i + 1) * 32 + 31);
     }
@@ -7225,7 +7229,7 @@ public:
   void CheckFaultRecordsOverflow() {
     constexpr const char *name = "FaultRecordsOverflow";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
-    constexpr u32 pages = 1216;
+    constexpr u32 pages = FaultManager::MaxPageFaults + 192;
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;
@@ -21011,10 +21015,11 @@ public:
     }
 
     const bool uses_bda = Count(Kind::BdaPagetable) != 0;
-    Require(test.name, "dispatch",
-            uses_bda == (Count(Kind::FaultBuffer) != 0),
+    // Shaders recording their written binding pages use the fault buffer without the page table.
+    const bool uses_faults = Count(Kind::FaultBuffer) != 0;
+    Require(test.name, "dispatch", !uses_bda || uses_faults,
             "BDA page table and fault buffer must be bound together");
-    if (uses_bda) {
+    if (uses_bda || uses_faults) {
       EnsureBdaBuffers(test.name);
       bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
                             m_bda_pagetable_buffer.size};
@@ -21024,6 +21029,7 @@ public:
           std::pair{Kind::FaultBuffer, &fault_buffer_info},
       };
       for (const auto &[kind, info] : special_buffers) {
+        if (Count(kind) == 0) continue;
         vk::WriteDescriptorSet write{};
         write.sType = vk::StructureType::eWriteDescriptorSet;
         write.dstSet = descriptor_set;
@@ -21060,6 +21066,13 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        if (layout.write_pages) {
+          // The binding's offset in the test buffer stands in for its guest address.
+          shader_data[layout.WritePageDword() + 2 * index] =
+              static_cast<u32>(BufferCache::PageIndex(info.offset) + 2 * BufferCache::CACHING_NUMPAGES);
+          shader_data[layout.WritePageDword() + 2 * index + 1] =
+              static_cast<u32>(info.offset & (BufferCache::CACHING_PAGESIZE - 1));
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -25448,8 +25461,9 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
-    m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 4, usage | vk::BufferUsageFlagBits::eTransferSrc);
+    // Fault bits, device-address store bits, then binding store bits (KYTY_PRECISE_WRITES).
+    m_fault_buffer = CreateDeviceBuffer(shader_name, BufferCache::CACHING_NUMPAGES * 3 / 8,
+                                        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,

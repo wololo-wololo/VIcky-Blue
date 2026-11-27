@@ -40,7 +40,36 @@ uint64_t DownloadWindowSizeFromEnv() {
 	const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
 	return kib != 0 && (kib & (kib - 1)) == 0 ? kib * 1024 : 4 * 1024 * 1024;
 }
-const uint64_t DownloadWindowSize = DownloadWindowSizeFromEnv();
+uint64_t DownloadWindowSize = DownloadWindowSizeFromEnv();
+
+// KYTY_PRECISE_WRITES: 1 drops the GPU-modified marking of written-binding bytes no shader store
+// reached; 2 only predicts them and counts downloaded bytes there that changed (should be none).
+// Must match Spirv::PreciseWrites(), which makes shaders record their written pages.
+uint32_t PreciseWritesModeFromEnv() {
+	const char* value = std::getenv("KYTY_PRECISE_WRITES");
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+}
+const uint32_t PreciseWritesMode = PreciseWritesModeFromEnv();
+
+struct PreciseStats {
+	uint64_t resolutions = 0, skipped_busy = 0, overflows = 0, clean_bytes = 0, unmarked_pages = 0;
+	uint64_t checked_bytes = 0, missed_bytes = 0;
+
+	void Report() {
+		if (++resolutions % 500u != 0u) return;
+		std::fprintf(stderr,
+		             "precise writes: 500 resolutions, %llu skipped (scan areas busy), %llu "
+		             "overflowed; %llu KiB found untouched, %llu tracker pages released; check: "
+		             "%llu KiB downloaded, %llu B changed\n",
+		             static_cast<unsigned long long>(skipped_busy),
+		             static_cast<unsigned long long>(overflows),
+		             static_cast<unsigned long long>(clean_bytes >> 10),
+		             static_cast<unsigned long long>(unmarked_pages),
+		             static_cast<unsigned long long>(checked_bytes >> 10),
+		             static_cast<unsigned long long>(missed_bytes));
+		skipped_busy = overflows = clean_bytes = unmarked_pages = checked_bytes = missed_bytes = 0;
+	}
+} g_precise_stats;
 
 // Debug aid (KYTY_READBACK_STATS): synchronous buffer downloads, which wait for the GPU. Counts
 // which marking made the bytes GPU-modified (a written binding or a device-address store) and how
@@ -235,6 +264,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
+	std::vector<std::pair<uint64_t, uint64_t>> predicted; // KYTY_PRECISE_WRITES=2 checks.
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
@@ -245,6 +275,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    if (PreciseWritesMode != 0) {
+			    m_gpu_confirmed.Subtract(address, bytes);
+			    if (PreciseWritesMode == 2) {
+				    m_predicted_clean.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+					    predicted.emplace_back(start, end);
+				    });
+				    m_predicted_clean.Subtract(address, bytes);
+			    }
+		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -311,12 +350,37 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	}
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
-	                download = std::move(download), measure] {
+	                download = std::move(download), measure, predicted = std::move(predicted)] {
 		download.buffer->Invalidate(download.offset, total_size);
 		uint64_t             changed = 0;
 		std::vector<uint8_t> old;
 		for (const auto& copy: copies) {
 			const auto* bytes = download.mapped + (copy.dstOffset - download.offset);
+			const auto  copy_start = buffer_address + copy.srcOffset;
+			for (const auto& [start, end]: predicted) {
+				// Bytes resolution found untouched must download unchanged.
+				const auto first = std::max(start, copy_start);
+				const auto last  = std::min(end, copy_start + copy.size);
+				if (first >= last) continue;
+				old.resize(last - first);
+				if (Libs::LibKernel::Memory::TryReadBacking(first, old.data(), last - first)) {
+					const auto* fresh = bytes + (first - copy_start);
+					uint64_t    missed = 0;
+					for (uint64_t i = 0; i < last - first; i++) {
+						missed += old[i] != fresh[i] ? 1u : 0u;
+					}
+					g_precise_stats.checked_bytes += last - first;
+					g_precise_stats.missed_bytes += missed;
+					static uint32_t reported = 0;
+					if (missed != 0 && reported++ < 32u) {
+						std::fprintf(stderr,
+						             "precise writes: missed write, %llu B changed in 0x%llx+0x%llx\n",
+						             static_cast<unsigned long long>(missed),
+						             static_cast<unsigned long long>(first),
+						             static_cast<unsigned long long>(last - first));
+					}
+				}
+			}
 			if (measure) {
 				old.resize(copy.size);
 				if (Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset,
@@ -421,6 +485,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
+			if (PreciseWritesMode != 0) {
+				ResolvePreciseWrites(start, end - start);
+			}
 			g_readback_stats.window = start;
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
@@ -604,7 +671,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, bool precise_writes) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
@@ -646,6 +713,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		if (PreciseWritesMode != 0) {
+			// A prediction holds only up to its resolution: the bytes may be written again now.
+			m_predicted_clean.Subtract(vaddr, size);
+			if (precise_writes) {
+				if (m_precise_open_window != m_draw_window) {
+					m_precise_open.ForEach([this](uint64_t start, uint64_t end) {
+						m_precise_recorded.Add(start, end - start);
+					});
+					m_precise_open        = {};
+					m_precise_open_window = m_draw_window;
+				}
+				m_precise_open.Add(vaddr, size);
+			} else {
+				m_gpu_confirmed.Add(vaddr, size);
+			}
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -870,7 +953,96 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 		}
 		m_gpu_modified_ranges.Add(first, last - first);
 		ForgetColorMetadataChecks(first, last - first);
+		if (PreciseWritesMode != 0) {
+			m_gpu_confirmed.Add(first, last - first);
+			m_predicted_clean.Subtract(first, last - first);
+		}
 	}
+}
+
+uint64_t BufferCache::SetDownloadWindow(uint64_t bytes) noexcept {
+	const auto previous = DownloadWindowSize;
+	DownloadWindowSize  = bytes;
+	return previous;
+}
+
+void BufferCache::NoteScannedWrite(uint64_t vaddr, uint64_t size) {
+	if (PreciseWritesMode != 0) {
+		m_gpu_confirmed.Add(vaddr, size);
+		m_predicted_clean.Subtract(vaddr, size);
+	}
+}
+
+void BufferCache::ResolvePreciseWrites(uint64_t vaddr, uint64_t size) {
+	if (m_precise_open_window != m_draw_window) {
+		m_precise_open.ForEach([this](uint64_t start, uint64_t end) {
+			m_precise_recorded.Add(start, end - start);
+		});
+		m_precise_open        = {};
+		m_precise_open_window = m_draw_window;
+	}
+	if (!m_precise_recorded.Intersects(vaddr, size)) {
+		return;
+	}
+	auto& stats = g_precise_stats;
+	// The scan's area must be free without running deferred operations: those can merge
+	// buffers while a draw is being prepared. Draws and dispatches pop them at their start.
+	if (!m_fault_manager.CanScanNow()) {
+		++stats.skipped_busy;
+		stats.Report();
+		return;
+	}
+	// Every recorded precise binding's stores precede this scan, which reports each page a
+	// shader stored to since the scan before it; earlier scans' pages are collected with it.
+	m_fault_manager.ProcessFaultBuffer();
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	if (!m_fault_manager.CollectWrittenPages(
+	        [this](uint64_t address) { NoteScannedWrite(address, CACHING_PAGESIZE); })) {
+		// Pages the scan could not report stay in the bitmap: resolve after a later scan.
+		++stats.overflows;
+		stats.Report();
+		return;
+	}
+	RangeSet clean;
+	m_precise_recorded.ForEach([&](uint64_t start, uint64_t end) {
+		clean.Add(start, end - start);
+		m_precise_open.ForEachInRange(start, end - start,
+		                              [&](uint64_t a, uint64_t b) { clean.Subtract(a, b - a); });
+		m_gpu_confirmed.ForEachInRange(start, end - start,
+		                               [&](uint64_t a, uint64_t b) { clean.Subtract(a, b - a); });
+	});
+	m_precise_recorded = {};
+	clean.ForEach([&](uint64_t start, uint64_t end) {
+		uint64_t marked = 0;
+		m_gpu_modified_ranges.ForEachInRange(start, end - start,
+		                                     [&](uint64_t a, uint64_t b) { marked += b - a; });
+		stats.clean_bytes += marked;
+		if (marked == 0) {
+			return;
+		}
+		if (PreciseWritesMode == 2) {
+			m_predicted_clean.Add(start, end - start);
+			return;
+		}
+		m_gpu_modified_ranges.Subtract(start, end - start);
+		// Release the tracker pages left with no GPU-modified byte, in runs.
+		const auto first = Common::AlignDown(start, TRACKER_PAGE_SIZE);
+		const auto last  = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+		uint64_t   run   = 0;
+		for (uint64_t page = first; page < last; page += TRACKER_PAGE_SIZE) {
+			const bool release = !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+			if (release) {
+				run = run == 0 ? page : run;
+				++stats.unmarked_pages;
+			}
+			if (run != 0 && (!release || page + TRACKER_PAGE_SIZE == last)) {
+				const auto run_end = release ? page + TRACKER_PAGE_SIZE : page;
+				m_memory_tracker.UnmarkRegionAsGpuModified(run, run_end - run);
+				run = 0;
+			}
+		}
+	});
+	stats.Report();
 }
 
 void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {

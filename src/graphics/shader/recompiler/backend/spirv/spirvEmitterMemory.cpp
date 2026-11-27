@@ -577,6 +577,7 @@ uint32_t LoadFormattedComponent(ValueEmitContext& ctx, const Format::BufferForma
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
+	MarkBufferWrite(ctx.state, resource, index, resource.element_bits / 8u);
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.element_bits < 32u) {
 		ctx.state.builder.AddFunction(
@@ -638,6 +639,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
+	MarkBufferWrite(ctx.state, resource, index, resource.element_bits / 8u);
 	ctx.state.builder.AddFunction(spv::OpStore,
 	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
 	                              resource.memory_access);
@@ -721,6 +723,7 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 				    const auto in_bounds = BufferIndexInBounds(ctx, inst, selected, resource,
 				        EmitStorageElementInBounds(ctx.state, resource, index));
 				    return EmitValueOrZeroIfCondition(ctx.state, in_bounds, [&]() {
+					    MarkBufferWrite(ctx.state, resource, index, resource.element_bits / 8u);
 					    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
 				    });
 			    });
@@ -734,6 +737,7 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+			    MarkBufferWrite(ctx.state, resource, index, resource.element_bits / 8u);
 			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
 		    });
 	});
@@ -1495,6 +1499,40 @@ void StoreIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& 
 
 } // namespace
 
+void MarkBufferWrite(EmitterState& state, const MemoryResourceAccess& resource, uint32_t index,
+                     uint32_t element_bytes) {
+	const auto& bindings = state.program.bindings;
+	if (!bindings.write_pages || (resource.kind != IR::ResourceKind::Buffer &&
+	                              resource.kind != IR::ResourceKind::ScalarBuffer)) {
+		return;
+	}
+	const auto u          = TypeU32(state);
+	const auto data_start = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
+	const auto dword      = EmitAddU32(state, ConstantU32(state, bindings.WritePageDword() + data_start),
+	                                   Binary(state, spv::OpShiftLeftLogical, u,
+	                                          resource.descriptor_index, ConstantU32(state, 1)));
+	const auto first_page = EmitShaderDataDwordLoadAt(state, dword);
+	const auto first_byte =
+	    EmitShaderDataDwordLoadAt(state, EmitAddU32(state, dword, ConstantU32(state, 1)));
+	const auto byte = EmitAddU32(
+	    state, first_byte,
+	    Binary(state, spv::OpShiftLeftLogical, u, index,
+	           ConstantU32(state, static_cast<uint32_t>(std::countr_zero(element_bytes)))));
+	const auto page = EmitAddU32(
+	    state, first_page,
+	    Binary(state, spv::OpShiftRightLogical, u, byte,
+	           ConstantU32(state, uint32_t {BufferCache::CACHING_PAGEBITS})));
+	// No branches: a test-then-set per store made the driver's compile time explode in shaders
+	// with many stores. Null bindings point at an unused bit, and drop their stores anyway.
+	const auto bit = Binary(state, spv::OpShiftLeftLogical, u, ConstantU32(state, 1),
+	                        Binary(state, spv::OpBitwiseAnd, u, page, ConstantU32(state, 31)));
+	state.builder.AddFunction(
+	    spv::OpAtomicOr, u, state.builder.AllocateId(),
+	    FaultElementPointer(state,
+	                        Binary(state, spv::OpShiftRightLogical, u, page, ConstantU32(state, 5))),
+	    ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+}
+
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
@@ -1654,6 +1692,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    return EmitValueOrDefaultIfCondition(
 		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
+			        MarkBufferWrite(state, resource, index, 8u);
 			        const auto pointer = EmitStorageBufferElementPointer(
 			            state, resource, index, TypeStorageBufferElementPointer(state, 64));
 			        const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
@@ -1783,6 +1822,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                 Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0)),
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
+		MarkBufferWrite(state, access, index, access.element_bits / 8u);
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
 		                          value, EmitMemoryElementPointer(state, access, index),
