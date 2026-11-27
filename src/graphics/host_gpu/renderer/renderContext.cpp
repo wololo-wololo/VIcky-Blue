@@ -220,7 +220,11 @@ struct BufferReadLog {
 // line gives the frame, the address, the set bits and a hash of the array. The array holds
 // KYTY_WRITE_WATCH_PTR_BITS=<n> bits, or as many as the dword at KYTY_WRITE_WATCH_PTR_COUNT=<addr>
 // says. A first write inside an array is reported as range 100 + the slot's index; one elsewhere on
-// its pages as range 90 + the index.
+// its pages as range 90 + the index. KYTY_WRITE_WATCH_PTR_READ=1 protects those pages against
+// reads too: each access then faults once, is counted per instruction with the array's set bits at
+// that moment, and the page is unprotected until the next write fault on a watched fixed range
+// (the draw jobs write command buffers between their reads) or the next flip. One line per frame,
+// slot and instruction gives the count and the bit range seen.
 struct WriteWatch {
 	struct Range {
 		uint64_t begin = 0;
@@ -247,11 +251,21 @@ struct WriteWatch {
         return value == nullptr ? size_t {0} : static_cast<size_t>(std::strtoull(value, nullptr, 0));
 	}();
 
+	struct Access {
+		uint64_t count = 0;
+		uint64_t min   = ~0ull;
+		uint64_t max   = 0;
+	};
 	struct Pointer {
-		uint64_t slot   = 0;
-		uint64_t target = 0;
-		uint64_t bytes  = 0;
-		uint64_t writes = 0;
+		uint64_t slot       = 0;
+		uint64_t target     = 0;
+		uint64_t bytes      = 0;
+		uint64_t bits       = 0;
+		uint64_t writes     = 0;
+		uint64_t read_page  = 0;
+		bool     read_armed = false;
+		// Key: instruction, with bit 63 set for a write access.
+		std::map<uint64_t, Access> accesses;
 	};
 	std::vector<Pointer> pointers = [] {
 		std::vector<Pointer> list;
@@ -275,6 +289,70 @@ struct WriteWatch {
 		const char* value = std::getenv("KYTY_WRITE_WATCH_PTR_COUNT");
 		return value == nullptr ? uint64_t {0} : std::strtoull(value, nullptr, 0);
 	}();
+
+	bool pointer_read = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_PTR_READ");
+		return value != nullptr && value[0] == '1';
+	}();
+
+	[[nodiscard]] uint64_t SetBits(const Pointer& pointer) const {
+		if (pointer.bytes == 0 ||
+		    LibKernel::Memory::ReadableHostBytes(pointer.target, pointer.bytes) != pointer.bytes) {
+			return ~0ull;
+		}
+		uint64_t set = 0;
+		for (uint64_t i = 0; i < pointer.bytes; i++) {
+			auto byte = reinterpret_cast<const uint8_t*>(pointer.target)[i];
+			if (i + 1 == pointer.bytes && (pointer.bits & 7u) != 0) {
+				byte &= static_cast<uint8_t>((1u << (pointer.bits & 7u)) - 1u);
+			}
+			set += static_cast<uint64_t>(std::popcount(byte));
+		}
+		return set;
+	}
+
+	void RearmReads(PageManager& pages, uint64_t except_page) {
+		for (auto& pointer: pointers) {
+			if (pointer.read_page != 0 && !pointer.read_armed && pointer.read_page != except_page) {
+				pointer.read_armed = true;
+				pages.UpdatePageWatchers<true, true>(pointer.read_page, 0x1000);
+			}
+		}
+	}
+
+	// Called for every fault before Note(). Returns true when the fault was on a read-armed array
+	// page (it is then unprotected).
+	bool NoteAccess(PageManager& pages, bool write, uint64_t vaddr, uint64_t rip) {
+		if (!pointer_read) {
+			return false;
+		}
+		const auto       page = vaddr & ~0xfffull;
+		std::scoped_lock lock {mutex};
+		bool             hit = false;
+		for (auto& pointer: pointers) {
+			if (!pointer.read_armed || pointer.read_page != page) {
+				continue;
+			}
+			pointer.read_armed = false;
+			pages.UpdatePageWatchers<false, true>(page, 0x1000);
+			hit = true;
+		}
+		if (!hit) {
+			return false;
+		}
+		for (auto& pointer: pointers) {
+			if (pointer.read_page != page || vaddr < pointer.target ||
+			    vaddr >= pointer.target + pointer.bytes) {
+				continue;
+			}
+			const auto set    = SetBits(pointer);
+			auto&      access = pointer.accesses[rip | (write ? (1ull << 63u) : 0)];
+			access.count++;
+			access.min = std::min(access.min, set);
+			access.max = std::max(access.max, set);
+		}
+		return true;
+	}
 
 	bool frame_pointers = [] {
 		const char* value = std::getenv("KYTY_WRITE_WATCH_FP");
@@ -346,12 +424,23 @@ struct WriteWatch {
 				arm(page);
 			}
 		}
-		FlipPointers(arm);
+		unarm_pages = &pages;
+		FlipPointers(arm, is_mapped);
+		if (pointer_read) {
+			RearmReads(pages, 0);
+		}
 		Report();
 	}
 
-	template <typename Arm>
-	void FlipPointers(Arm&& arm) {
+	PageManager* unarm_pages = nullptr;
+	void         Unarm(uint64_t page) const {
+        if (unarm_pages != nullptr && page != 0) {
+            unarm_pages->UpdatePageWatchers<false, true>(page, 0x1000);
+        }
+	}
+
+	template <typename Arm, typename IsMapped>
+	void FlipPointers(Arm&& arm, IsMapped&& is_mapped) {
 		if (pointers.empty()) {
 			return;
 		}
@@ -365,8 +454,30 @@ struct WriteWatch {
 			if (LibKernel::Memory::ReadableHostBytes(pointer.slot, 8) != 8) {
 				continue;
 			}
-			pointer.target = *reinterpret_cast<const uint64_t*>(pointer.slot);
+			for (const auto& [key, access]: pointer.accesses) {
+				std::fprintf(stderr,
+				             "write watch access: frame %llu slot %zu %s 0x%llx x%llu bits %llu-%llu\n",
+				             static_cast<unsigned long long>(DrawDumpFrameIndex()), i,
+				             (key >> 63u) != 0 ? "write" : "read",
+				             static_cast<unsigned long long>(key & ~(1ull << 63u)),
+				             static_cast<unsigned long long>(access.count),
+				             static_cast<unsigned long long>(access.min),
+				             static_cast<unsigned long long>(access.max));
+			}
+			pointer.accesses.clear();
+			const auto target = *reinterpret_cast<const uint64_t*>(pointer.slot);
+			if (pointer_read) {
+				// Unprotected here so the array can be read below; RearmReads() protects it again.
+				if (pointer.read_armed) {
+					pointer.read_armed = false;
+					Unarm(pointer.read_page);
+				}
+				const auto page   = target & ~0xfffull;
+				pointer.read_page = (target != 0 && is_mapped(page)) ? page : 0;
+			}
+			pointer.target = target;
 			pointer.bytes  = (bits + 7) / 8;
+			pointer.bits   = bits;
 			if (pointer.target == 0 || pointer.bytes == 0) {
 				continue;
 			}
@@ -395,6 +506,9 @@ struct WriteWatch {
 			             static_cast<unsigned long long>(XXH3_64bits(data.data(), data.size())),
 			             static_cast<unsigned long long>(pointer.writes));
 			pointer.writes = 0;
+			if (pointer_read) {
+				continue;
+			}
 			for (auto page = pointer.target & ~0xfffull; page < pointer.target + pointer.bytes; page += 0x1000) {
 				arm(page);
 			}
@@ -411,6 +525,9 @@ struct WriteWatch {
 		it->second = false;
 		pages.UpdatePageWatchers<false, false>(page, 0x1000);
 		faults++;
+		if (pointer_read) {
+			RearmReads(pages, page);
+		}
 		std::vector<uint64_t> key {rip};
 		if (frame_pointers && rsp != 0) {
 			const auto limit = depth > 0 ? depth : size_t {40};
@@ -719,6 +836,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, ui
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	if (g_write_watch.Enabled() &&
+	    g_write_watch.NoteAccess(m_page_manager, access == PageFaultAccess::Write, fault_vaddr, fault_rip)) {
+		return true;
 	}
 	if (access == PageFaultAccess::Write && g_write_watch.Enabled()) {
 		(void)g_write_watch.Note(m_page_manager, fault_vaddr, fault_rip, fault_rsp, fault_rbp);
