@@ -100,6 +100,9 @@ public:
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
+	// Debug aid (issue 22), KYTY_IMAGE_READ_WATCH: notes a guest access to a page armed after an
+	// image copy-back and disarms it.
+	void NoteReadWatchFault(bool write, uint64_t address, uint64_t rip) noexcept;
 
 private:
 	struct MetaDataInfo {

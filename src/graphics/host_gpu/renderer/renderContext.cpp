@@ -299,7 +299,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
+                                uint64_t fault_rip) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -310,6 +311,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
 	}
+	m_texture_cache.NoteReadWatchFault(access == PageFaultAccess::Write, fault_vaddr, fault_rip);
 	AliasLogNote(access == PageFaultAccess::Write ? AliasUse::WriteFault : AliasUse::ReadFault,
 	             fault_vaddr, fault_size);
 	if (access == PageFaultAccess::Write && AliasLogMode() >= 3) {

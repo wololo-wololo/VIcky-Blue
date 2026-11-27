@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 
 #include <chrono>
 #include <cstdio>
@@ -2069,6 +2070,125 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+namespace {
+
+// Debug aid (issue 22), KYTY_IMAGE_READ_WATCH: after an image copy-back lands in guest memory,
+// the next guest access to each of its pages faults once and is recorded, with the instruction
+// and thread that made it. Shows whether the title's CPU reads what the GPU computed.
+struct ReadWatch {
+	struct Image {
+		uint64_t size   = 0;
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		int      format = 0;
+		bool     tiled  = false;
+	};
+	struct Site {
+		uint64_t    count = 0;
+		std::string thread;
+	};
+	struct Stats {
+		Image                              image;
+		uint64_t                           copy_backs = 0, reads = 0, writes = 0, outside = 0;
+		std::unordered_map<uint64_t, Site> sites;
+	};
+	struct Armed {
+		uint64_t image_address = 0;
+	};
+
+	bool                                  enabled = std::getenv("KYTY_IMAGE_READ_WATCH") != nullptr;
+	uint64_t                              max_size = 1024u * 1024u;
+	std::mutex                            mutex;
+	std::unordered_map<uint64_t, Armed>   armed;
+	std::map<uint64_t, Stats>             stats;
+	uint64_t                              total_reads = 0, total_writes = 0, total_copy_backs = 0;
+	int64_t                               last_report_ns = 0;
+
+	void ReportLocked() {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns == 0) {
+			last_report_ns = now;
+			return;
+		}
+		if (now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr,
+		             "read watch: %llu copy-backs armed, %llu guest reads, %llu guest writes, %zu "
+		             "pages armed\n",
+		             static_cast<unsigned long long>(total_copy_backs),
+		             static_cast<unsigned long long>(total_reads),
+		             static_cast<unsigned long long>(total_writes), armed.size());
+		std::vector<std::pair<uint64_t, Stats*>> touched;
+		for (auto& [address, s]: stats) {
+			if (s.reads + s.writes != 0) {
+				touched.emplace_back(address, &s);
+			}
+		}
+		std::sort(touched.begin(), touched.end(), [](const auto& a, const auto& b) {
+			return a.second->reads + a.second->writes > b.second->reads + b.second->writes;
+		});
+		if (touched.size() > 24) {
+			touched.resize(24);
+		}
+		for (const auto& [address, s]: touched) {
+			std::vector<std::pair<uint64_t, const Site*>> sites;
+			for (const auto& [rip, site]: s->sites) {
+				sites.emplace_back(rip, &site);
+			}
+			std::sort(sites.begin(), sites.end(),
+			          [](const auto& a, const auto& b) { return a.second->count > b.second->count; });
+			char text[512] = {};
+			size_t used = 0;
+			for (size_t i = 0; i < sites.size() && i < 4 && used < sizeof(text); i++) {
+				const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx x%llu [%s]",
+				                            static_cast<unsigned long long>(sites[i].first),
+				                            static_cast<unsigned long long>(sites[i].second->count),
+				                            sites[i].second->thread.c_str());
+				if (n < 0) {
+					break;
+				}
+				used += static_cast<size_t>(n);
+			}
+			std::fprintf(stderr,
+			             "read watch:   0x%llx %ux%u %s vk %d %llu B: copy-backs %llu, reads %llu, "
+			             "writes %llu, outside the image %llu; at%s\n",
+			             static_cast<unsigned long long>(address), s->image.width, s->image.height,
+			             s->image.tiled ? "tiled" : "linear", s->image.format,
+			             static_cast<unsigned long long>(s->image.size),
+			             static_cast<unsigned long long>(s->copy_backs),
+			             static_cast<unsigned long long>(s->reads),
+			             static_cast<unsigned long long>(s->writes),
+			             static_cast<unsigned long long>(s->outside), text);
+		}
+		std::vector<std::pair<uint64_t, const Stats*>> untouched;
+		for (const auto& [address, s]: stats) {
+			if (s.reads + s.writes == 0) {
+				untouched.emplace_back(address, &s);
+			}
+		}
+		std::sort(untouched.begin(), untouched.end(), [](const auto& a, const auto& b) {
+			return a.second->copy_backs > b.second->copy_backs;
+		});
+		for (size_t i = 0; i < untouched.size() && i < 8; i++) {
+			const auto& s = *untouched[i].second;
+			std::fprintf(stderr,
+			             "read watch:   not touched: 0x%llx %ux%u %s vk %d %llu B, copy-backs %llu\n",
+			             static_cast<unsigned long long>(untouched[i].first), s.image.width,
+			             s.image.height, s.image.tiled ? "tiled" : "linear", s.image.format,
+			             static_cast<unsigned long long>(s.image.size),
+			             static_cast<unsigned long long>(s.copy_backs));
+		}
+		stats.clear();
+		total_reads = total_writes = total_copy_backs = 0;
+	}
+} g_read_watch;
+
+} // namespace
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -2109,10 +2229,31 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	const ReadWatch::Image watch_image {range.size, image.info.extent.width,
+	                                   image.info.extent.height,
+	                                   static_cast<int>(image.info.pixel_format),
+	                                   image.info.IsTiled()};
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
+	                                    trapped = m_readback_storage_images, watch_image] {
 		download.buffer->Invalidate(download.offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		if (auto& watch = g_read_watch; watch.enabled && range.size <= watch.max_size) {
+			std::scoped_lock watch_lock {watch.mutex};
+			auto& s       = watch.stats[range.address];
+			s.image       = watch_image;
+			s.copy_backs++;
+			watch.total_copy_backs++;
+			const auto end = Common::AlignUp(range.address + range.size, TRACKER_PAGE_SIZE);
+			for (auto page = Common::AlignDown(range.address, TRACKER_PAGE_SIZE); page < end;
+			     page += TRACKER_PAGE_SIZE) {
+				auto [it, inserted] = watch.armed.try_emplace(page);
+				it->second.image_address = range.address;
+				if (inserted) {
+					m_page_manager.UpdatePageWatchers<true, true>(page, TRACKER_PAGE_SIZE);
+				}
+			}
+			watch.ReportLocked();
+		}
 		if (trapped) {
 			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			// Priority operations run in queue order, so this write-back is the oldest.
@@ -2469,7 +2610,40 @@ struct ReadbackLog {
 	}
 } g_readback_log;
 
+
 } // namespace
+
+void TextureCache::NoteReadWatchFault(bool write, uint64_t address, uint64_t rip) noexcept {
+	auto& watch = g_read_watch;
+	if (!watch.enabled) {
+		return;
+	}
+	const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	std::scoped_lock lock {watch.mutex};
+	const auto it = watch.armed.find(page);
+	if (it == watch.armed.end()) {
+		return;
+	}
+	const auto image_address = it->second.image_address;
+	watch.armed.erase(it);
+	m_page_manager.UpdatePageWatchers<false, true>(page, TRACKER_PAGE_SIZE);
+	auto& s = watch.stats[image_address];
+	(write ? s.writes : s.reads)++;
+	(write ? watch.total_writes : watch.total_reads)++;
+	if (address < image_address || address >= image_address + s.image.size) {
+		s.outside++;
+	}
+	auto& site = s.sites[rip];
+	if (site.count++ == 0) {
+		char name[64] = "(host thread)";
+		if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (LibKernel::PthreadGetname(self, name) != 0) {
+				std::snprintf(name, sizeof(name), "(unnamed)");
+			}
+		}
+		site.thread = name;
+	}
+}
 
 bool TextureCache::DownloadQueuedImages() {
 	std::scoped_lock lock {m_lock};

@@ -661,14 +661,16 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			// reads zero.
 			uint32_t value = 0;
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
-			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+			                                            info->exception_address)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 				return true;
 			}
 			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 			return true;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+		                                            info->exception_address)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
@@ -1687,6 +1689,13 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	if (std::getenv("KYTY_IMAGE_READ_WATCH") != nullptr) {
+		// Lets the read watch's instruction addresses be mapped to module offsets.
+		std::fprintf(stderr, "read watch: module %s base 0x%llx size 0x%llx\n",
+		             Common::PathToString(program->file_name.filename()).c_str(),
+		             static_cast<unsigned long long>(program->base_vaddr),
+		             static_cast<unsigned long long>(program->mapped_size));
+	}
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
 	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
