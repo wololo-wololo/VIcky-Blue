@@ -35,6 +35,8 @@ struct RenderExecutorTestAccess;
 // DrawDumpPresent records the index of the frame being presented, shown in the window title.
 bool     DrawDumpEnabled();
 uint64_t DrawDumpFlip(CommandScheduler& scheduler);
+// The draw dump index of the guest frame being recorded (0 without KYTY_DRAW_DUMP).
+uint64_t DrawDumpFrameIndex();
 void     DrawDumpPresent(uint64_t frame);
 uint64_t DrawDumpPresentedFrame();
 

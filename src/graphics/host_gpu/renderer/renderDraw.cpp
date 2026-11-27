@@ -1076,6 +1076,7 @@ struct DrawDumpState {
 	std::shared_ptr<DrawDumpFrame>       current;
 	uint64_t                             frame = 0;
 	std::atomic<uint64_t>                presented {0};
+	std::atomic<uint64_t>                recording {0};
 };
 
 DrawDumpState& GetDrawDump() {
@@ -1290,6 +1291,7 @@ uint64_t DrawDumpFlip(CommandScheduler& scheduler) {
 		frame = std::move(dump.current);
 		dump.current.reset();
 		index = dump.frame++;
+		dump.recording.store(dump.frame);
 	}
 	const uint64_t timeouts = Libs::LibKernel::WaitDebug::FrameTimeouts().exchange(0);
 	if (frame) {
@@ -1302,6 +1304,10 @@ uint64_t DrawDumpFlip(CommandScheduler& scheduler) {
 		});
 	}
 	return index;
+}
+
+uint64_t DrawDumpFrameIndex() {
+	return GetDrawDump().recording.load();
 }
 
 void DrawDumpPresent(uint64_t frame) {

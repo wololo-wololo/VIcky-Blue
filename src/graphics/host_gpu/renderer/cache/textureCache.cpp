@@ -2072,6 +2072,67 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 namespace {
 
+// Debug aid (issue 22), KYTY_IMAGE_VALUE_LOG=<address>,...: for the listed image addresses, the
+// contents of every copy-back (non-zero dwords by byte offset, tagged with the draw dump frame
+// index at which the copy-back was recorded) and, with KYTY_IMAGE_READ_WATCH, each first guest
+// access after it.
+struct ValueLog {
+	std::vector<uint64_t> addresses = [] {
+		std::vector<uint64_t> list;
+		if (const char* value = std::getenv("KYTY_IMAGE_VALUE_LOG"); value != nullptr) {
+			const char* p = value;
+			while (*p != '\0') {
+				char*      end     = nullptr;
+				const auto address = std::strtoull(p, &end, 0);
+				if (end == p) {
+					break;
+				}
+				list.push_back(address);
+				p = (*end == ',') ? end + 1 : end;
+			}
+		}
+		return list;
+	}();
+
+	[[nodiscard]] bool Contains(uint64_t address) const {
+		return std::find(addresses.begin(), addresses.end(), address) != addresses.end();
+	}
+
+	void Contents(uint64_t frame, uint64_t address, const void* data, uint64_t size,
+	              int format) const {
+		const auto* dwords = static_cast<const uint32_t*>(data);
+		const auto  count  = static_cast<size_t>(size / 4);
+		char        text[1600] = {};
+		size_t      used = 0, shown = 0, nonzero = 0;
+		for (size_t i = 0; i < count; i++) {
+			if (dwords[i] == 0) {
+				continue;
+			}
+			nonzero++;
+			if (shown >= 48 || used >= sizeof(text) - 64) {
+				continue;
+			}
+			float as_float = 0.0f;
+			std::memcpy(&as_float, &dwords[i], sizeof(as_float));
+			const int n = format == static_cast<int>(vk::Format::eR32G32B32A32Sfloat)
+			                  ? std::snprintf(text + used, sizeof(text) - used, " +%zx=%g",
+			                                  i * 4, static_cast<double>(as_float))
+			                  : std::snprintf(text + used, sizeof(text) - used, " +%zx=%08x",
+			                                  i * 4, dwords[i]);
+			if (n < 0) {
+				break;
+			}
+			used += static_cast<size_t>(n);
+			shown++;
+		}
+		std::fprintf(stderr, "value log: frame %llu copy-back 0x%llx vk %d: %zu non-zero dwords%s\n",
+		             static_cast<unsigned long long>(frame),
+		             static_cast<unsigned long long>(address), format, nonzero, text);
+	}
+};
+
+const ValueLog g_value_log;
+
 // Debug aid (issue 22), KYTY_IMAGE_READ_WATCH: after an image copy-back lands in guest memory,
 // the next guest access to each of its pages faults once and is recorded, with the instruction
 // and thread that made it. Shows whether the title's CPU reads what the GPU computed.
@@ -2233,9 +2294,16 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                   image.info.extent.height,
 	                                   static_cast<int>(image.info.pixel_format),
 	                                   image.info.IsTiled()};
+	const uint64_t value_frame =
+	    g_value_log.Contains(range.address) ? DrawDumpFrameIndex() + 1 : 0;
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images, watch_image] {
+	                                    trapped = m_readback_storage_images, watch_image,
+	                                    value_frame] {
 		download.buffer->Invalidate(download.offset, range.size);
+		if (value_frame != 0) {
+			g_value_log.Contents(value_frame - 1, range.address, download.mapped, range.size,
+			                     watch_image.format);
+		}
 		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
 		if (auto& watch = g_read_watch; watch.enabled && range.size <= watch.max_size) {
 			std::scoped_lock watch_lock {watch.mutex};
@@ -2632,6 +2700,13 @@ void TextureCache::NoteReadWatchFault(bool write, uint64_t address, uint64_t rip
 	(write ? watch.total_writes : watch.total_reads)++;
 	if (address < image_address || address >= image_address + s.image.size) {
 		s.outside++;
+	}
+	if (g_value_log.Contains(image_address)) {
+		std::fprintf(stderr, "value log: frame %llu guest %s 0x%llx (+%llx) at 0x%llx\n",
+		             static_cast<unsigned long long>(DrawDumpFrameIndex()), write ? "write" : "read",
+		             static_cast<unsigned long long>(image_address),
+		             static_cast<unsigned long long>(address - image_address),
+		             static_cast<unsigned long long>(rip));
 	}
 	auto& site = s.sites[rip];
 	if (site.count++ == 0) {
