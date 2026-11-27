@@ -20,6 +20,29 @@
 
 namespace Libs::Graphics {
 
+// Debug aid (issue 22, KYTY_ALIAS_LOG): counts GPU-cache uses of physically aliased guest ranges.
+// StaleImage: an aliased image, not GPU-modified and not known to be CPU-dirty, whose sampled
+// guest bytes changed since its last refresh (a write the caches did not see).
+enum class AliasUse { BufferSync, ImageRefresh, WriteFault, ReadFault, StaleImage, Count };
+// Returns whether the range overlaps an aliased range.
+bool AliasLogNote(AliasUse use, uint64_t vaddr, uint64_t size);
+// Returns whether the snapshot of aliased ranges changed.
+bool AliasLogTick();
+// Experiment (issue 22), KYTY_ALIAS_LOG=3: the caches keep aliased guest ranges in step through
+// guest memory. AliasPartners lists, for the aliased pieces of a range, the piece on this side and
+// the address of the same bytes on the other side.
+struct AliasPartner {
+	uint64_t vaddr;
+	uint64_t partner;
+	uint64_t size;
+};
+int  AliasLogMode();
+// Experiment (issue 22), KYTY_ALIAS_FLUSH=1 (with KYTY_ALIAS_LOG set): before each end-of-pipe
+// signal and each flip, GPU-written bytes in aliased ranges are downloaded into guest memory, so a
+// CPU read through the other address (which does not fault) sees them too.
+bool AliasFlushEnabled();
+void AliasPartners(uint64_t vaddr, uint64_t size, std::vector<AliasPartner>& out);
+
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
@@ -104,6 +127,11 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// Experiment (issue 22), KYTY_ALIAS_LOG=4: device-address accesses through the upper side of
+	// an alias reach the lower side's host buffer. Rewrites the entries of every registered buffer.
+	void               RefreshAliasPageTable();
+	// KYTY_ALIAS_FLUSH: downloads the GPU-modified bytes of aliased ranges. GPU thread only.
+	void               DownloadAliasedGpuWrites();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -152,6 +180,13 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// KYTY_ALIAS_LOG=4: the host address the page at `page_vaddr` has in its own buffer, or 0.
+	[[nodiscard]] vk::DeviceAddress OwnPageAddress(uint64_t page_vaddr);
+	// KYTY_ALIAS_LOG=4: the guest page holding the bytes a store through `page_vaddr` reached.
+	[[nodiscard]] uint64_t          StorePage(uint64_t page_vaddr);
+	// KYTY_ALIAS_LOG=4: rewrites the upper-side entries of the aliased pieces in the range.
+	void                            UpdateAliasPageEntries(uint64_t vaddr, uint64_t size);
+	void                            MarkGpuWrittenRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
@@ -193,6 +228,13 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	std::array<StreamCopy, 1u << STREAM_COPY_BITS>    m_stream_copies {};
 	uint64_t                                          m_draw_window = 0;
+	// Issue 22 counter: bytes SynchronizeBuffer last uploaded, and those MarkGpuWritten uploaded
+	// from CPU-dirtied guest memory over pages a shader wrote through device addresses.
+	uint64_t                                          m_last_upload_bytes = 0;
+	uint64_t m_bda_overwrite_bytes = 0, m_bda_overwrite_uploads = 0, m_bda_marked_bytes = 0;
+	uint64_t m_alias_syncs = 0, m_alias_sync_bytes = 0, m_alias_conflicts = 0;
+	uint64_t m_alias_entries = 0, m_alias_redirected_stores = 0;
+	uint64_t m_alias_flush_calls = 0, m_alias_flush_reads = 0, m_alias_flush_bytes = 0;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

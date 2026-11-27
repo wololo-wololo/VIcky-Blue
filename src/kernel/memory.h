@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -14,6 +16,17 @@ namespace Libs::LibKernel::Memory {
 
 void Initialize();
 void Shutdown();
+
+// Debug aid (issue 22, KYTY_ALIAS_LOG): direct-memory ranges mapped while another live mapping
+// shares their physical memory, one entry per side. Entries are removed when their own side is
+// unmapped, so a partner entry can outlive the alias.
+struct AliasedRange {
+	uint64_t vaddr;
+	uint64_t size;
+	uint64_t other_vaddr;
+};
+bool                      AliasLogEnabled();
+std::vector<AliasedRange> AliasedRanges();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.

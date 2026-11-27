@@ -4,13 +4,184 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <algorithm>
 
 namespace Libs::Graphics {
+
+namespace {
+
+struct AliasLog {
+	struct Hit {
+		uint64_t size        = 0;
+		uint64_t other_vaddr = 0;
+		uint64_t counts[static_cast<int>(AliasUse::Count)] {};
+	};
+	std::mutex                                     mutex;
+	std::vector<LibKernel::Memory::AliasedRange> ranges;
+	uint64_t                                       max_size = 0;
+	uint64_t                                       tick     = 0;
+	uint64_t uses[static_cast<int>(AliasUse::Count)] {}, bytes[static_cast<int>(AliasUse::Count)] {};
+	uint64_t all[static_cast<int>(AliasUse::Count)] {};
+	std::map<uint64_t, Hit> hits;
+};
+
+AliasLog& GetAliasLog() {
+	static AliasLog log;
+	return log;
+}
+
+} // namespace
+
+bool AliasLogNote(AliasUse use, uint64_t vaddr, uint64_t size) {
+	if (!LibKernel::Memory::AliasLogEnabled() || size == 0) {
+		return false;
+	}
+	auto&           log = GetAliasLog();
+	std::lock_guard lock(log.mutex);
+	const auto      kind = static_cast<int>(use);
+	++log.all[kind];
+	auto it = std::ranges::upper_bound(log.ranges, vaddr + size - 1, {},
+	                                   &LibKernel::Memory::AliasedRange::vaddr);
+	bool counted = false;
+	while (it != log.ranges.begin()) {
+		--it;
+		if (it->vaddr + log.max_size <= vaddr) {
+			break;
+		}
+		if (it->vaddr + it->size <= vaddr) {
+			continue;
+		}
+		const auto start = std::max(it->vaddr, vaddr);
+		const auto end   = std::min(it->vaddr + it->size, vaddr + size);
+		if (!counted) {
+			++log.uses[kind];
+			counted = true;
+		}
+		log.bytes[kind] += end - start;
+		auto& hit       = log.hits[it->vaddr];
+		hit.size        = it->size;
+		hit.other_vaddr = it->other_vaddr;
+		++hit.counts[kind];
+	}
+	return counted;
+}
+
+int AliasLogMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_ALIAS_LOG");
+		return value != nullptr ? std::max(1, std::atoi(value)) : 0;
+	}();
+	return mode;
+}
+
+bool AliasFlushEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ALIAS_FLUSH");
+		return value != nullptr && std::atoi(value) != 0 && AliasLogMode() >= 1;
+	}();
+	return enabled;
+}
+
+void AliasPartners(uint64_t vaddr, uint64_t size, std::vector<AliasPartner>& out) {
+	if ((AliasLogMode() < 3 && !AliasFlushEnabled()) || size == 0) {
+		return;
+	}
+	auto&           log = GetAliasLog();
+	std::lock_guard lock(log.mutex);
+	auto it = std::ranges::upper_bound(log.ranges, vaddr + size - 1, {},
+	                                   &LibKernel::Memory::AliasedRange::vaddr);
+	while (it != log.ranges.begin()) {
+		--it;
+		if (it->vaddr + log.max_size <= vaddr) {
+			break;
+		}
+		if (it->vaddr + it->size <= vaddr) {
+			continue;
+		}
+		const auto start = std::max(it->vaddr, vaddr);
+		const auto end   = std::min(it->vaddr + it->size, vaddr + size);
+		out.push_back({start, it->other_vaddr + (start - it->vaddr), end - start});
+	}
+}
+
+bool AliasLogTick() {
+	if (!LibKernel::Memory::AliasLogEnabled()) {
+		return false;
+	}
+	auto ranges = LibKernel::Memory::AliasedRanges();
+	auto& log   = GetAliasLog();
+	std::lock_guard lock(log.mutex);
+	const auto tick    = log.tick++;
+	bool       changed = false;
+	if (tick % 64u == 0u) {
+		uint64_t total = 0;
+		log.max_size   = 0;
+		for (const auto& range: ranges) {
+			total += range.size;
+			log.max_size = std::max(log.max_size, range.size);
+		}
+		changed    = ranges.size() != log.ranges.size();
+		log.ranges = std::move(ranges);
+		std::fprintf(stderr, "alias ranges: %llu entries, %llu KiB (both sides)\n",
+		             static_cast<unsigned long long>(log.ranges.size()),
+		             static_cast<unsigned long long>(total >> 10));
+	}
+	if (tick % 256u != 255u) {
+		return changed;
+	}
+	std::fprintf(stderr,
+	             "alias use in 256 frames: buffer syncs %llu of %llu (%llu KiB), image refreshes "
+	             "%llu of %llu (%llu KiB), write faults %llu of %llu, read faults %llu of %llu, "
+	             "stale aliased images %llu (%llu KiB)\n",
+	             static_cast<unsigned long long>(log.uses[0]),
+	             static_cast<unsigned long long>(log.all[0]),
+	             static_cast<unsigned long long>(log.bytes[0] >> 10),
+	             static_cast<unsigned long long>(log.uses[1]),
+	             static_cast<unsigned long long>(log.all[1]),
+	             static_cast<unsigned long long>(log.bytes[1] >> 10),
+	             static_cast<unsigned long long>(log.uses[2]),
+	             static_cast<unsigned long long>(log.all[2]),
+	             static_cast<unsigned long long>(log.uses[3]),
+	             static_cast<unsigned long long>(log.all[3]),
+	             static_cast<unsigned long long>(log.uses[4]),
+	             static_cast<unsigned long long>(log.bytes[4] >> 10));
+	std::vector<std::pair<uint64_t, AliasLog::Hit>> hits(log.hits.begin(), log.hits.end());
+	std::ranges::sort(hits, [](const auto& a, const auto& b) {
+		const auto sum = [](const AliasLog::Hit& h) {
+			return h.counts[0] + h.counts[1] + h.counts[2] + h.counts[3] + h.counts[4] * 1000u;
+		};
+		return sum(a.second) > sum(b.second);
+	});
+	for (size_t i = 0; i < hits.size() && i < 12; i++) {
+		const auto& [vaddr, hit] = hits[i];
+		const auto other         = log.hits.find(hit.other_vaddr);
+		std::fprintf(stderr,
+		             "  alias va 0x%llx+0x%llx (other side 0x%llx): buffer %llu image %llu "
+		             "write-fault %llu read-fault %llu stale %llu; other side used %s\n",
+		             static_cast<unsigned long long>(vaddr),
+		             static_cast<unsigned long long>(hit.size),
+		             static_cast<unsigned long long>(hit.other_vaddr),
+		             static_cast<unsigned long long>(hit.counts[0]),
+		             static_cast<unsigned long long>(hit.counts[1]),
+		             static_cast<unsigned long long>(hit.counts[2]),
+		             static_cast<unsigned long long>(hit.counts[3]),
+		             static_cast<unsigned long long>(hit.counts[4]),
+		             other != log.hits.end() ? "yes" : "no");
+	}
+	std::fill(std::begin(log.uses), std::end(log.uses), 0);
+	std::fill(std::begin(log.bytes), std::end(log.bytes), 0);
+	std::fill(std::begin(log.all), std::end(log.all), 0);
+	log.hits.clear();
+	return changed;
+}
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -71,6 +242,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The access retries once the image write-backs over its page land.
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
+	}
+	AliasLogNote(access == PageFaultAccess::Write ? AliasUse::WriteFault : AliasUse::ReadFault,
+	             fault_vaddr, fault_size);
+	if (access == PageFaultAccess::Write && AliasLogMode() >= 3) {
+		std::vector<AliasPartner> partners;
+		AliasPartners(fault_vaddr, fault_size, partners);
+		for (const auto& partner: partners) {
+			if (IsMapped(partner.partner, partner.size)) {
+				m_buffer_cache.InvalidateMemory(partner.partner, partner.size);
+				m_texture_cache.InvalidateMemory(partner.partner, partner.size);
+				m_image_heap.InvalidateMemory(partner.partner, partner.size);
+			}
+		}
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -197,6 +381,9 @@ void RenderContext::PublishGpuWritesBeforeRead() {
 }
 
 void RenderContext::RunGarbageCollector() {
+	if (AliasLogTick() && AliasLogMode() >= 4) {
+		m_buffer_cache.RefreshAliasPageTable();
+	}
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

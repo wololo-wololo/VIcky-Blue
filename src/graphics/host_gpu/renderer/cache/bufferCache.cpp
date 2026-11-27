@@ -244,6 +244,118 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+	if (AliasLogMode() >= 4) {
+		UpdateAliasPageEntries(buffer.CpuAddress(), buffer.Size());
+	}
+}
+
+vk::DeviceAddress BufferCache::OwnPageAddress(uint64_t page_vaddr) {
+	const auto* owner = m_page_table.Find(page_vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return 0;
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	if (buffer.is_deleted) {
+		return 0;
+	}
+	return buffer.BufferDeviceAddress() + (page_vaddr - buffer.CpuAddress());
+}
+
+uint64_t BufferCache::StorePage(uint64_t page_vaddr) {
+	std::vector<AliasPartner> partners;
+	AliasPartners(page_vaddr, CACHING_PAGESIZE, partners);
+	for (const auto& partner: partners) {
+		if (partner.partner >= partner.vaddr || partner.vaddr != page_vaddr ||
+		    partner.size != CACHING_PAGESIZE ||
+		    (partner.vaddr - partner.partner) % CACHING_PAGESIZE != 0) {
+			continue;
+		}
+		if (OwnPageAddress(partner.partner) != 0) {
+			return partner.partner;
+		}
+	}
+	return page_vaddr;
+}
+
+void BufferCache::UpdateAliasPageEntries(uint64_t vaddr, uint64_t size) {
+	// The lower side of each alias owns the bytes: entries of the upper side's pages point at the
+	// lower side's buffer while it has one, else at their own buffer (or nothing).
+	std::vector<AliasPartner> partners;
+	AliasPartners(vaddr, size, partners);
+	if (partners.empty()) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, vk::DeviceAddress>> entries;
+	for (const auto& partner: partners) {
+		const auto lower = std::min(partner.vaddr, partner.partner);
+		const auto upper = std::max(partner.vaddr, partner.partner);
+		const auto delta = upper - lower;
+		if (delta == 0 || delta % CACHING_PAGESIZE != 0) {
+			continue;
+		}
+		const auto first = Common::AlignUp(upper, CACHING_PAGESIZE);
+		const auto last  = Common::AlignDown(upper + partner.size, CACHING_PAGESIZE);
+		for (auto page = first; page < last; page += CACHING_PAGESIZE) {
+			auto entry = OwnPageAddress(page - delta);
+			if (entry == 0) {
+				entry = OwnPageAddress(page);
+			}
+			entries.emplace_back(page, entry);
+		}
+	}
+	std::ranges::sort(entries, {}, &std::pair<uint64_t, vk::DeviceAddress>::first);
+	std::vector<vk::DeviceAddress> run;
+	uint64_t                       run_page = 0;
+	const auto                     flush    = [&] {
+        if (!run.empty()) {
+            WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(run_page) * sizeof(vk::DeviceAddress),
+                            run.data(), run.size() * sizeof(vk::DeviceAddress));
+            m_alias_entries += run.size();
+            run.clear();
+        }
+	};
+	for (const auto& [page, entry]: entries) {
+		if (!run.empty() && page == run_page + run.size() * CACHING_PAGESIZE) {
+			run.push_back(entry);
+			continue;
+		}
+		if (!run.empty() && page < run_page + run.size() * CACHING_PAGESIZE) {
+			continue; // The same page listed twice.
+		}
+		flush();
+		run_page = page;
+		run.push_back(entry);
+	}
+	flush();
+}
+
+void BufferCache::DownloadAliasedGpuWrites() {
+	++m_alias_flush_calls;
+	// Collect first: each read changes the GPU-modified set.
+	RangeSet pieces;
+	m_gpu_modified_ranges.ForEach([&](uint64_t start, uint64_t end) {
+		std::vector<AliasPartner> partners;
+		AliasPartners(start, end - start, partners);
+		for (const auto& partner: partners) {
+			pieces.Add(partner.vaddr, partner.size);
+		}
+	});
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	pieces.ForEach([&](uint64_t start, uint64_t end) { ranges.emplace_back(start, end - start); });
+	for (const auto& [vaddr, size]: ranges) {
+		if (!IsRegionGpuModified(vaddr, size)) {
+			continue;
+		}
+		ReadMemory(vaddr, size);
+		++m_alias_flush_reads;
+		m_alias_flush_bytes += size;
+	}
+}
+
+void BufferCache::RefreshAliasPageTable() {
+	for (const auto& [address, id]: m_buffers) {
+		UpdateAliasPageEntries(address, m_slot_buffers[id].Size());
+	}
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -604,8 +716,29 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (AliasLogNote(AliasUse::BufferSync, vaddr, size) && AliasLogMode() >= 3) {
+		// Bytes the GPU wrote through the other side reach this side through guest memory.
+		std::vector<AliasPartner> partners;
+		AliasPartners(vaddr, size, partners);
+		for (const auto& partner: partners) {
+			if (!IsRegionRegistered(partner.partner, partner.size) ||
+			    !IsRegionGpuModified(partner.partner, partner.size)) {
+				continue;
+			}
+			if (IsRegionGpuModified(partner.vaddr, partner.size)) {
+				++m_alias_conflicts;
+				continue;
+			}
+			ReadMemory(partner.partner, partner.size);
+			m_memory_tracker.MarkRegionAsCpuModified(partner.vaddr, partner.size);
+			QueueBdaSync(partner.vaddr, partner.size);
+			++m_alias_syncs;
+			m_alias_sync_bytes += partner.size;
+		}
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
+	m_last_upload_bytes                    = 0;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -613,6 +746,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept {
+		    m_last_upload_bytes = total_size;
 		    const BufferUpload upload {&buffer, copies.size()};
 		    UploadCopies({&upload, 1}, copies, total_size);
 	    });
@@ -879,6 +1013,41 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	if (tick % 256u == 255u) {
+		std::fprintf(stderr,
+		             "bda overwrite: %llu uploads, %llu KiB of CPU-dirty pages uploaded over "
+		             "device-address writes in 256 frames (%llu KiB marked)\n",
+		             static_cast<unsigned long long>(m_bda_overwrite_uploads),
+		             static_cast<unsigned long long>(m_bda_overwrite_bytes >> 10),
+		             static_cast<unsigned long long>(m_bda_marked_bytes >> 10));
+		m_bda_overwrite_uploads = m_bda_overwrite_bytes = m_bda_marked_bytes = 0;
+		if (AliasLogMode() >= 3) {
+			std::fprintf(stderr,
+			             "alias sync: %llu syncs (%llu KiB) from the other side's GPU writes, %llu "
+			             "conflicts (both sides GPU-written) in 256 frames\n",
+			             static_cast<unsigned long long>(m_alias_syncs),
+			             static_cast<unsigned long long>(m_alias_sync_bytes >> 10),
+			             static_cast<unsigned long long>(m_alias_conflicts));
+			m_alias_syncs = m_alias_sync_bytes = m_alias_conflicts = 0;
+		}
+		if (AliasLogMode() >= 4) {
+			std::fprintf(stderr,
+			             "alias bda: %llu page-table entries rewritten, %llu stores through the upper "
+			             "side marked on the lower side in 256 frames\n",
+			             static_cast<unsigned long long>(m_alias_entries),
+			             static_cast<unsigned long long>(m_alias_redirected_stores));
+			m_alias_entries = m_alias_redirected_stores = 0;
+		}
+		if (AliasFlushEnabled()) {
+			std::fprintf(stderr,
+			             "alias flush: %llu signals, %llu reads (%llu KiB of aliased ranges with GPU "
+			             "writes) in 256 frames\n",
+			             static_cast<unsigned long long>(m_alias_flush_calls),
+			             static_cast<unsigned long long>(m_alias_flush_reads),
+			             static_cast<unsigned long long>(m_alias_flush_bytes >> 10));
+			m_alias_flush_calls = m_alias_flush_reads = m_alias_flush_bytes = 0;
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -932,6 +1101,25 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
+	if (AliasLogMode() < 4) {
+		MarkGpuWrittenRange(vaddr, size);
+		return;
+	}
+	// KYTY_ALIAS_LOG=4: a store through the upper side of an alias reached the lower side's buffer.
+	const auto end = vaddr + size;
+	for (auto page = Common::AlignDown(vaddr, CACHING_PAGESIZE); page < end;
+	     page += CACHING_PAGESIZE) {
+		const auto first  = std::max(page, vaddr);
+		const auto last   = std::min(page + CACHING_PAGESIZE, end);
+		const auto target = StorePage(page);
+		if (target != page) {
+			++m_alias_redirected_stores;
+		}
+		MarkGpuWrittenRange(target + (first - page), last - first);
+	}
+}
+
+void BufferCache::MarkGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 	// The store went through the page table, so cache buffers back the range. Each takes the
 	// same path as a written binding: pending guest writes are uploaded first, then the range
 	// becomes GPU-modified and is downloaded when the guest next reads it.
@@ -948,6 +1136,12 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		(void)SynchronizeBuffer(buffer, first, last - first, true, false);
+		// The upload replaces whole CPU-dirty tracker pages, so GPU bytes in them are lost.
+		m_bda_marked_bytes += last - first;
+		if (m_last_upload_bytes != 0) {
+			m_bda_overwrite_bytes += m_last_upload_bytes;
+			++m_bda_overwrite_uploads;
+		}
 		if (g_readback_stats.enabled) {
 			g_readback_stats.bda_writes.Add(first, last - first);
 		}

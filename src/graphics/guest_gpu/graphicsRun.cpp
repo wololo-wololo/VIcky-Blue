@@ -959,6 +959,12 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
+	// Experiment (issue 22), KYTY_ALIAS_FLUSH: GPU writes in aliased ranges reach guest memory
+	// before the signal, for CPU reads through the other address.
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
+
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
 	// downloads GPU-written bytes under the label before the store.
@@ -1091,6 +1097,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
@@ -1100,6 +1109,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(

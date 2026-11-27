@@ -22,13 +22,16 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <tuple>
 #include <utility>
+#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1277,8 +1280,27 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+// Debug aid (issue 22, KYTY_ALIAS_LOG): a sampled hash of an image's guest bytes (256 bytes every
+// 64 KiB or more, at most 4,096 samples), read from the backing without faulting.
+static uint64_t SampleGuestHash(const ImageInfo& info) {
+	std::array<uint8_t, 256> bytes {};
+	const auto               range = info.data;
+	const uint64_t           step  = std::max<uint64_t>(0x10000u, range.size / 4096u);
+	uint64_t                 hash  = 0;
+	for (uint64_t offset = 0; offset < range.size; offset += step) {
+		const auto size = std::min<uint64_t>(bytes.size(), range.size - offset);
+		if (!LibKernel::Memory::TryReadBacking(range.address + offset, bytes.data(), size)) {
+			return 0;
+		}
+		hash = XXH3_64bits_withSeed(bytes.data(), static_cast<size_t>(size), hash);
+	}
+	return hash;
+}
+
 void TextureCache::RefreshImage(ImageId id) {
-	auto& image = m_slot_images[id];
+	auto&      image = m_slot_images[id];
+	const bool aliased =
+	    AliasLogNote(AliasUse::ImageRefresh, image.info.data.address, image.info.data.size);
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
@@ -1289,6 +1311,21 @@ void TextureCache::RefreshImage(ImageId id) {
 		image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
+	// Experiment (issue 22): KYTY_ALIAS_LOG=2 also re-uploads aliased images whose guest bytes
+	// changed unseen.
+	if (aliased && !image.IsGpuModified() &&
+	    image.info.metadata.compression == VideoOutCompression::Uncompressed) {
+		static std::unordered_map<uint64_t, uint64_t> hashes;
+		static const int mode = std::atoi(std::getenv("KYTY_ALIAS_LOG"));
+		const auto       key  = image.info.data.address ^ (image.info.data.size << 40u);
+		const auto       hash = SampleGuestHash(image.info);
+		const auto [it, inserted] = hashes.try_emplace(key, hash);
+		if (!inserted && it->second != hash && !cpu_dirty) {
+			AliasLogNote(AliasUse::StaleImage, image.info.data.address, image.info.data.size);
+			cpu_dirty = cpu_dirty || mode >= 2;
+		}
+		it->second = hash;
+	}
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
 			EXIT("TextureCache: compressed guest image refresh is unsupported\n");

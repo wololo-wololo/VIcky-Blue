@@ -16,6 +16,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -1203,6 +1204,31 @@ bool PhysicalMemory::Release(uint64_t start, size_t len) {
 	return true;
 }
 
+static std::mutex                g_alias_mutex;
+static std::vector<AliasedRange> g_aliases;
+
+bool AliasLogEnabled() {
+	static const bool enabled = std::getenv("KYTY_ALIAS_LOG") != nullptr;
+	return enabled;
+}
+
+std::vector<AliasedRange> AliasedRanges() {
+	std::lock_guard lock(g_alias_mutex);
+	auto            ranges = g_aliases;
+	std::ranges::sort(ranges, {}, &AliasedRange::vaddr);
+	return ranges;
+}
+
+static void ForgetAliases(uint64_t vaddr, uint64_t size) {
+	if (!AliasLogEnabled()) {
+		return;
+	}
+	std::lock_guard lock(g_alias_mutex);
+	std::erase_if(g_aliases, [&](const AliasedRange& range) {
+		return range.vaddr < vaddr + size && vaddr < range.vaddr + range.size;
+	});
+}
+
 bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	if (vaddr == 0 || len == 0 || UINT64_MAX - vaddr < len || !CanMapDirect(phys_addr, len)) {
 		return false;
@@ -1212,6 +1238,41 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	    (next != m_mappings.begin() &&
 	     std::prev(next)->first + std::prev(next)->second.size > vaddr)) {
 		return false;
+	}
+
+	// Debug aid (issue 22), KYTY_ALIAS_LOG: report direct memory mapped at a second virtual
+	// address while the first mapping is live. The GPU caches track writes per virtual address.
+	if (AliasLogEnabled()) {
+		static uint64_t reported = 0;
+		static uint64_t aliased  = 0;
+		for (const auto& [other_vaddr, other]: m_mappings) {
+			const auto start = std::max(other.start_addr, phys_addr);
+			const auto end   = std::min(other.start_addr + other.size, phys_addr + len);
+			if (start >= end) {
+				continue;
+			}
+			aliased += end - start;
+			{
+				std::lock_guard lock(g_alias_mutex);
+				const auto      this_side  = vaddr + (start - phys_addr);
+				const auto      other_side = other_vaddr + (start - other.start_addr);
+				g_aliases.push_back({this_side, end - start, other_side});
+				g_aliases.push_back({other_side, end - start, this_side});
+			}
+			if (reported++ < 200u || reported % 1000u == 0u) {
+				std::fprintf(stderr,
+				             "phys alias: va 0x%llx+0x%llx (phys 0x%llx) shares 0x%llx bytes at "
+				             "phys 0x%llx with va 0x%llx+0x%llx; %llu KiB aliased so far\n",
+				             static_cast<unsigned long long>(vaddr),
+				             static_cast<unsigned long long>(len),
+				             static_cast<unsigned long long>(phys_addr),
+				             static_cast<unsigned long long>(end - start),
+				             static_cast<unsigned long long>(start),
+				             static_cast<unsigned long long>(other_vaddr),
+				             static_cast<unsigned long long>(other.size),
+				             static_cast<unsigned long long>(aliased >> 10));
+			}
+		}
 	}
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
@@ -1313,6 +1374,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 		first              = m_mappings.erase(first);
 		ReclaimAutomatic(removed.start_addr, removed.size);
 	}
+	ForgetAliases(vaddr, size);
 	return true;
 }
 
