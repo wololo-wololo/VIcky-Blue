@@ -16,7 +16,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -28,7 +31,83 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
-constexpr uint64_t DownloadWindowSize = 512 * 1024;
+// A readback of GPU-modified bytes also takes the GPU-modified bytes around it, so later reads
+// nearby do not each wait for the GPU. 4 MiB measured 9 % faster in the cell than 512 KiB (most
+// reads after a wait then find their bytes already downloaded). KYTY_DOWNLOAD_WINDOW_KIB (a power
+// of two) overrides it for experiments.
+uint64_t DownloadWindowSizeFromEnv() {
+	const char* value = std::getenv("KYTY_DOWNLOAD_WINDOW_KIB");
+	const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	return kib != 0 && (kib & (kib - 1)) == 0 ? kib * 1024 : 4 * 1024 * 1024;
+}
+const uint64_t DownloadWindowSize = DownloadWindowSizeFromEnv();
+
+// Debug aid (KYTY_READBACK_STATS): synchronous buffer downloads, which wait for the GPU. Counts
+// which marking made the bytes GPU-modified (a written binding or a device-address store) and how
+// many downloaded bytes differ from guest memory, so needless waits show up.
+struct ReadbackStats {
+	bool     enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	RangeSet binding_writes; // Marked by written bindings since the last download of the bytes.
+	RangeSet bda_writes;     // Marked by device-address stores.
+	std::map<std::pair<uint64_t, uint64_t>, uint64_t> bindings; // Written binding -> count.
+	struct Window {
+		uint64_t count = 0, bytes = 0, changed = 0, binding = 0, bda = 0, buffer = 0, size = 0;
+	};
+	std::map<uint64_t, Window> windows;
+	uint64_t downloads = 0, bytes = 0, changed = 0, binding = 0, bda = 0, unchanged_downloads = 0;
+	uint64_t window = 0; // Window of the download in progress.
+
+	void Report() {
+		if (++downloads % 500u != 0u) return;
+		std::fprintf(stderr,
+		             "readback stats: 500 sync downloads, %llu KiB, %llu KiB changed (%.1f%%), "
+		             "%llu downloads changed nothing; marked by bindings %llu KiB, by device "
+		             "address %llu KiB\n",
+		             static_cast<unsigned long long>(bytes >> 10),
+		             static_cast<unsigned long long>(changed >> 10),
+		             bytes != 0 ? 100.0 * static_cast<double>(changed) / static_cast<double>(bytes)
+		                        : 0.0,
+		             static_cast<unsigned long long>(unchanged_downloads),
+		             static_cast<unsigned long long>(binding >> 10),
+		             static_cast<unsigned long long>(bda >> 10));
+		std::vector<std::pair<uint64_t, uint64_t>> top; // (count, window)
+		for (const auto& [start, entry]: windows) top.emplace_back(entry.count, start);
+		std::sort(top.begin(), top.end(), std::greater<>());
+		for (size_t i = 0; i < top.size() && i < 8u; i++) {
+			const auto& w = windows[top[i].second];
+			std::fprintf(stderr,
+			             "readback stats:   x%llu window 0x%llx buffer 0x%llx+0x%llx: %llu KiB, "
+			             "%llu B changed, bindings %llu KiB, device address %llu KiB;",
+			             static_cast<unsigned long long>(w.count),
+			             static_cast<unsigned long long>(top[i].second),
+			             static_cast<unsigned long long>(w.buffer),
+			             static_cast<unsigned long long>(w.size),
+			             static_cast<unsigned long long>(w.bytes >> 10),
+			             static_cast<unsigned long long>(w.changed),
+			             static_cast<unsigned long long>(w.binding >> 10),
+			             static_cast<unsigned long long>(w.bda >> 10));
+			// The written bindings over this window, most frequent first.
+			std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> over;
+			for (const auto& [range, count]: bindings) {
+				if (range.first < top[i].second + DownloadWindowSize &&
+				    top[i].second < range.first + range.second) {
+					over.emplace_back(count, range);
+				}
+			}
+			std::sort(over.begin(), over.end(), std::greater<>());
+			for (size_t j = 0; j < over.size() && j < 3u; j++) {
+				std::fprintf(stderr, " written 0x%llx+0x%llx x%llu",
+				             static_cast<unsigned long long>(over[j].second.first),
+				             static_cast<unsigned long long>(over[j].second.second),
+				             static_cast<unsigned long long>(over[j].first));
+			}
+			std::fprintf(stderr, "\n");
+		}
+		windows.clear();
+		bindings.clear();
+		bytes = changed = binding = bda = unchanged_downloads = 0;
+	}
+} g_readback_stats;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -205,13 +284,57 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [total_size, buffer_address, copies = std::move(copies),
-	                download = std::move(download)] {
-		download.buffer->Invalidate(download.offset, total_size);
+	auto& stats   = g_readback_stats;
+	const bool measure = !async && stats.enabled;
+	if (measure) {
+		auto& window = stats.windows[stats.window];
+		++window.count;
+		window.buffer = buffer_address;
+		window.size   = buffer.Size();
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(
-			    buffer_address + copy.srcOffset,
-			    download.mapped + (copy.dstOffset - download.offset), copy.size);
+			const auto start = buffer_address + copy.srcOffset;
+			uint64_t   from_binding = 0, from_bda = 0;
+			stats.binding_writes.ForEachInRange(start, copy.size, [&](uint64_t a, uint64_t b) {
+				from_binding += b - a;
+			});
+			stats.bda_writes.ForEachInRange(start, copy.size, [&](uint64_t a, uint64_t b) {
+				from_bda += b - a;
+			});
+			stats.binding_writes.Subtract(start, copy.size);
+			stats.bda_writes.Subtract(start, copy.size);
+			window.bytes += copy.size;
+			window.binding += from_binding;
+			window.bda += from_bda;
+			stats.bytes += copy.size;
+			stats.binding += from_binding;
+			stats.bda += from_bda;
+		}
+	}
+	auto publish = [total_size, buffer_address, copies = std::move(copies),
+	                download = std::move(download), measure] {
+		download.buffer->Invalidate(download.offset, total_size);
+		uint64_t             changed = 0;
+		std::vector<uint8_t> old;
+		for (const auto& copy: copies) {
+			const auto* bytes = download.mapped + (copy.dstOffset - download.offset);
+			if (measure) {
+				old.resize(copy.size);
+				if (Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset,
+				                                            old.data(), copy.size)) {
+					for (uint64_t i = 0; i < copy.size; i++) {
+						changed += old[i] != bytes[i] ? 1u : 0u;
+					}
+				}
+			}
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, bytes,
+			                                      copy.size);
+		}
+		if (measure) {
+			auto& stats = g_readback_stats;
+			stats.windows[stats.window].changed += changed;
+			stats.changed += changed;
+			stats.unchanged_downloads += changed == 0 ? 1u : 0u;
+			stats.Report();
 		}
 	};
 	if constexpr (async) {
@@ -298,6 +421,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
+			g_readback_stats.window = start;
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
 			}
@@ -516,6 +640,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (g_readback_stats.enabled) {
+			g_readback_stats.binding_writes.Add(vaddr, size);
+			++g_readback_stats.bindings[{vaddr, size}];
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
@@ -737,6 +865,9 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		(void)SynchronizeBuffer(buffer, first, last - first, true, false);
+		if (g_readback_stats.enabled) {
+			g_readback_stats.bda_writes.Add(first, last - first);
+		}
 		m_gpu_modified_ranges.Add(first, last - first);
 		ForgetColorMetadataChecks(first, last - first);
 	}

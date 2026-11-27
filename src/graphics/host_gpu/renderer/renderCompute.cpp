@@ -31,6 +31,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -513,10 +515,21 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
+	// Issue 22 experiment: KYTY_NO_ZERO_DISPATCH_SKIP=1 records the dispatch even when guest memory
+	// shows zero arguments, in case a device-address store not yet published has set them.
+	static const bool keep_zero = std::getenv("KYTY_NO_ZERO_DISPATCH_SKIP") != nullptr;
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
-		return;
+		static uint64_t zero_args = 0;
+		if (++zero_args % 1000u == 1u) {
+			std::fprintf(stderr, "zero-args dispatches: %llu%s\n",
+			             static_cast<unsigned long long>(zero_args),
+			             keep_zero ? " (recorded)" : " (skipped)");
+		}
+		if (!keep_zero) {
+			return;
+		}
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
