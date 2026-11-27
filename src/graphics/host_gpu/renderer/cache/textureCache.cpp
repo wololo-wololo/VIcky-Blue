@@ -2072,30 +2072,37 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 namespace {
 
-// Debug aid (issue 22), KYTY_IMAGE_VALUE_LOG=<address>,...: for the listed image addresses, the
+// Debug aid (issue 22), KYTY_IMAGE_VALUE_LOG=<address>|vk<format>,...: for the listed image
+// addresses, and images up to 4 KiB in the listed Vulkan formats, the
 // contents of every copy-back (non-zero dwords by byte offset, tagged with the draw dump frame
 // index at which the copy-back was recorded) and, with KYTY_IMAGE_READ_WATCH, each first guest
 // access after it.
 struct ValueLog {
-	std::vector<uint64_t> addresses = [] {
-		std::vector<uint64_t> list;
-		if (const char* value = std::getenv("KYTY_IMAGE_VALUE_LOG"); value != nullptr) {
-			const char* p = value;
-			while (*p != '\0') {
-				char*      end     = nullptr;
-				const auto address = std::strtoull(p, &end, 0);
-				if (end == p) {
-					break;
-				}
-				list.push_back(address);
-				p = (*end == ',') ? end + 1 : end;
-			}
-		}
-		return list;
-	}();
+	std::vector<uint64_t> addresses;
+	std::vector<int>      formats;
 
-	[[nodiscard]] bool Contains(uint64_t address) const {
-		return std::find(addresses.begin(), addresses.end(), address) != addresses.end();
+	ValueLog() {
+		const char* p = std::getenv("KYTY_IMAGE_VALUE_LOG");
+		while (p != nullptr && *p != '\0') {
+			const bool format = p[0] == 'v' && p[1] == 'k';
+			const char* start = format ? p + 2 : p;
+			char*       end   = nullptr;
+			const auto  value = std::strtoull(start, &end, 0);
+			if (end == start) {
+				break;
+			}
+			if (format) {
+				formats.push_back(static_cast<int>(value));
+			} else {
+				addresses.push_back(value);
+			}
+			p = (*end == ',') ? end + 1 : end;
+		}
+	}
+
+	[[nodiscard]] bool Contains(uint64_t address, int format, uint64_t size) const {
+		return std::find(addresses.begin(), addresses.end(), address) != addresses.end() ||
+		       (size <= 4096u && std::find(formats.begin(), formats.end(), format) != formats.end());
 	}
 
 	void Contents(uint64_t frame, uint64_t address, const void* data, uint64_t size,
@@ -2295,7 +2302,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                   static_cast<int>(image.info.pixel_format),
 	                                   image.info.IsTiled()};
 	const uint64_t value_frame =
-	    g_value_log.Contains(range.address) ? DrawDumpFrameIndex() + 1 : 0;
+	    g_value_log.Contains(range.address, watch_image.format, range.size)
+	        ? DrawDumpFrameIndex() + 1
+	        : 0;
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
 	                                    trapped = m_readback_storage_images, watch_image,
 	                                    value_frame] {
@@ -2701,7 +2710,7 @@ void TextureCache::NoteReadWatchFault(bool write, uint64_t address, uint64_t rip
 	if (address < image_address || address >= image_address + s.image.size) {
 		s.outside++;
 	}
-	if (g_value_log.Contains(image_address)) {
+	if (g_value_log.Contains(image_address, s.image.format, s.image.size)) {
 		std::fprintf(stderr, "value log: frame %llu guest %s 0x%llx (+%llx) at 0x%llx\n",
 		             static_cast<unsigned long long>(DrawDumpFrameIndex()), write ? "write" : "read",
 		             static_cast<unsigned long long>(image_address),
