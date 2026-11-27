@@ -210,6 +210,9 @@ struct BufferReadLog {
 // with the writing instruction and the first code addresses found on the writer's stack (a
 // stand-in for its callers), and unprotects the page. KYTY_WRITE_WATCH_CODE=<begin>-<end> sets
 // the code range those stack values must fall in (default: the main program's usual range).
+// KYTY_WRITE_WATCH_DEPTH=<n> walks the stack up to its readable end and keeps up to n values that
+// are return addresses (the bytes before them encode a call), instead of the first 4 code values
+// in 64 qwords.
 struct WriteWatch {
 	struct Range {
 		uint64_t begin = 0;
@@ -231,6 +234,33 @@ struct WriteWatch {
 	std::map<std::vector<uint64_t>, Chain>       chains;
 	uint64_t                                     faults = 0, flips = 0;
 	int64_t                                      last_report_ns = 0;
+	size_t                                       depth = [] {
+        const char* value = std::getenv("KYTY_WRITE_WATCH_DEPTH");
+        return value == nullptr ? size_t {0} : static_cast<size_t>(std::strtoull(value, nullptr, 0));
+	}();
+
+	// True when the code bytes before ret encode a call: E8 rel32, or FF /2 (with an optional REX
+	// prefix) through a register or memory operand of 0, 1, 4 or 5 more bytes.
+	static bool IsReturnAddress(uint64_t ret) {
+		uint8_t bytes[8];
+		if (LibKernel::Memory::ReadableHostBytes(ret - 8, 8) < 8) {
+			return false;
+		}
+		std::memcpy(bytes, reinterpret_cast<const void*>(ret - 8), 8);
+		if (bytes[3] == 0xe8) {
+			return true;
+		}
+		for (const int n: {2, 3, 6, 7}) {
+			const auto* insn = bytes + 8 - n;
+			if (insn[0] == 0xff && ((insn[1] >> 3u) & 7u) == 2) {
+				return true;
+			}
+			if (n > 2 && (insn[0] & 0xf0u) == 0x40 && insn[1] == 0xff && ((insn[2] >> 3u) & 7u) == 2) {
+				return true;
+			}
+		}
+		return false;
+	}
 
 	static std::vector<Range> Parse(const char* text) {
 		std::vector<Range> list;
@@ -285,7 +315,16 @@ struct WriteWatch {
 		pages.UpdatePageWatchers<false, false>(page, 0x1000);
 		faults++;
 		std::vector<uint64_t> key {rip};
-		if (rsp != 0) {
+		if (rsp != 0 && depth > 0) {
+			const auto  bytes = LibKernel::Memory::ReadableHostBytes(rsp, 0x40000);
+			const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
+			for (uint64_t i = 0; i < bytes / 8 && key.size() <= depth; i++) {
+				const auto value = stack[i];
+				if (value >= code.begin && value < code.end && IsReturnAddress(value)) {
+					key.push_back(value);
+				}
+			}
+		} else if (rsp != 0) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
 			for (int i = 0; i < 64 && key.size() < 5; i++) {
 				const auto value = stack[i];
@@ -326,8 +365,9 @@ struct WriteWatch {
 		std::vector<std::pair<std::vector<uint64_t>, Chain>> top(chains.begin(), chains.end());
 		std::sort(top.begin(), top.end(),
 		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
-		for (size_t i = 0; i < top.size() && i < 16; i++) {
-			char   text[256] = {};
+		const size_t limit = depth > 0 ? 200 : 16;
+		for (size_t i = 0; i < top.size() && i < limit; i++) {
+			char   text[1024] = {};
 			size_t used      = 0;
 			for (const auto value: top[i].first) {
 				const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx",
