@@ -1079,6 +1079,8 @@ struct DrawDumpState {
 	std::atomic<uint64_t>                recording {0};
 };
 
+std::atomic<uint64_t> g_draw_dump_packet {0};
+
 DrawDumpState& GetDrawDump() {
 	static DrawDumpState state;
 	return state;
@@ -1114,7 +1116,7 @@ void DrawDumpRecord(RenderContext& context, vk::CommandBuffer vk_buffer, Command
 	DrawDumpFrame::Record record;
 	char                  line[512];
 	std::snprintf(line, sizeof(line),
-	              "%zu rt=%llx/%u ds=%llx dw=%d ib=%llx n=%u inst=%u ind=%llx:%u:%u",
+	              "%zu rt=%llx/%u ds=%llx dw=%d ib=%llx n=%u inst=%u ind=%llx:%u:%u pkt=%llx",
 	              frame.records.size(),
 	              static_cast<unsigned long long>(
 	                  targets.color_count != 0 ? targets.colors[0].desc.info.data.address : 0),
@@ -1124,7 +1126,8 @@ void DrawDumpRecord(RenderContext& context, vk::CommandBuffer vk_buffer, Command
 	              static_cast<unsigned long long>(draw.indexed ? index_source.address : 0),
 	              draw.index_count, draw.instance_count,
 	              static_cast<unsigned long long>(emit.indirect.address), emit.indirect.count,
-	              emit.indirect.stride);
+	              emit.indirect.stride,
+	              static_cast<unsigned long long>(g_draw_dump_packet.load(std::memory_order_relaxed)));
 	record.text = line;
 	for (const auto* stage: stages) {
 		const auto* runtime = stage->runtime;
@@ -1308,6 +1311,10 @@ uint64_t DrawDumpFlip(CommandScheduler& scheduler) {
 
 uint64_t DrawDumpFrameIndex() {
 	return GetDrawDump().recording.load();
+}
+
+void DrawDumpSetPacket(uint64_t address) {
+	g_draw_dump_packet.store(address, std::memory_order_relaxed);
 }
 
 void DrawDumpPresent(uint64_t frame) {

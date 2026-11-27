@@ -37,6 +37,8 @@ bool     DrawDumpEnabled();
 uint64_t DrawDumpFlip(CommandScheduler& scheduler);
 // The draw dump index of the guest frame being recorded (0 without KYTY_DRAW_DUMP).
 uint64_t DrawDumpFrameIndex();
+// The guest address of the PM4 packet being processed; draw dump lines show it as pkt=.
+void     DrawDumpSetPacket(uint64_t address);
 void     DrawDumpPresent(uint64_t frame);
 uint64_t DrawDumpPresentedFrame();
 

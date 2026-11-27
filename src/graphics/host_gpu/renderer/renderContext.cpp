@@ -354,6 +354,12 @@ struct WriteWatch {
 		return true;
 	}
 
+	// KYTY_WRITE_WATCH_PAGES=1: one line per first write with the frame, the page and its chain.
+	bool log_pages = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_PAGES");
+		return value != nullptr && value[0] == '1';
+	}();
+
 	bool frame_pointers = [] {
 		const char* value = std::getenv("KYTY_WRITE_WATCH_FP");
 		return value != nullptr && value[0] == '1';
@@ -587,6 +593,21 @@ struct WriteWatch {
 		if (chain.count++ == 0) {
 			chain.page  = page;
 			chain.range = range_index;
+		}
+		if (log_pages) {
+			char   text[1024] = {};
+			size_t used       = 0;
+			for (const auto value: key) {
+				const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx",
+				                            static_cast<unsigned long long>(value));
+				if (n < 0 || static_cast<size_t>(n) >= sizeof(text) - used) {
+					break;
+				}
+				used += static_cast<size_t>(n);
+			}
+			std::fprintf(stderr, "write watch page: frame %llu page 0x%llx at%s\n",
+			             static_cast<unsigned long long>(DrawDumpFrameIndex()),
+			             static_cast<unsigned long long>(page), text);
 		}
 		return true;
 	}

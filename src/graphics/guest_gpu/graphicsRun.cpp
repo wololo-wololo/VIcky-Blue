@@ -803,6 +803,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (!g_cp_op_keeps_draw_window[opcode]) {
 			m_renderer.GetBufferCache().EndDrawWindow();
 		}
+		DrawDumpSetPacket(reinterpret_cast<uint64_t>(packet));
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
