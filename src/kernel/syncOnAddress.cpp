@@ -1,4 +1,5 @@
 #include "kernel/syncOnAddress.h"
+#include "kernel/waitDebug.h"
 
 #include "common/threads.h"
 #include "libs/errno.h"
@@ -57,7 +58,7 @@ struct WaitDeadline {
 	if (timeout_micros == nullptr) {
 		return {};
 	}
-	return MakeDeadline(std::chrono::microseconds(*timeout_micros));
+	return MakeDeadline(std::chrono::microseconds(Libs::LibKernel::WaitDebug::ScaleUs(*timeout_micros)));
 }
 
 [[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
@@ -257,11 +258,21 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline) {
 } // namespace
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
+	const int ret = WaitImpl(address, expected, MakeDeadline(timeout_micros));
+	if (timeout_micros != nullptr) {
+		Libs::LibKernel::WaitDebug::NoteWait(Libs::LibKernel::WaitDebug::Address, *timeout_micros,
+		                                     ret == KERNEL_ERROR_ETIMEDOUT);
+	}
+	return ret;
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
+	const int ret = WaitImpl(address, expected, MakeDeadline(timeout_micros));
+	if (timeout_micros != nullptr) {
+		Libs::LibKernel::WaitDebug::NoteWait(Libs::LibKernel::WaitDebug::Address, *timeout_micros,
+		                                     ret == KERNEL_ERROR_ETIMEDOUT);
+	}
+	return ret;
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout) {

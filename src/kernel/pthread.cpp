@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/waitDebug.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -1276,7 +1277,7 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	mutex->last_waiter = &waiter;
 	const auto deadline = timeout_us != nullptr
 	                          ? std::chrono::steady_clock::now() +
-	                                std::chrono::microseconds(*timeout_us)
+	                                std::chrono::microseconds(WaitDebug::ScaleUs(*timeout_us))
 	                          : std::chrono::steady_clock::time_point::max();
 	int result = OK;
 	while (mutex->owner != self) {
@@ -1291,6 +1292,9 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	}
 	lock.unlock();
 	pthread_setcancelstate(previous_cancel_state, nullptr);
+	if (timeout_us != nullptr) {
+		WaitDebug::NoteWait(WaitDebug::Mutex, *timeout_us, result == ETIMEDOUT);
+	}
 	return result;
 }
 
@@ -2333,7 +2337,8 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 
 	const auto has_timeout = (timeout_us != nullptr);
 	const auto deadline =
-	    (has_timeout ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
+	    (has_timeout ? std::chrono::steady_clock::now() +
+	                       std::chrono::microseconds(WaitDebug::ScaleUs(*timeout_us))
 	                 : std::chrono::steady_clock::time_point {});
 	bool writer_wait_registered = false;
 	auto unregister_writer_wait = [&rwlock, &writer_wait_registered] {
@@ -2373,6 +2378,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 			const auto now = std::chrono::steady_clock::now();
 			if (*timeout_us == 0 || now >= deadline) {
 				unregister_writer_wait();
+				WaitDebug::NoteWait(WaitDebug::Rwlock, *timeout_us, true);
 				return KERNEL_ERROR_ETIMEDOUT;
 			}
 
@@ -2852,12 +2858,18 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
+	const auto deadline =
+	    std::chrono::steady_clock::now() + std::chrono::microseconds(WaitDebug::ScaleUs(usec));
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
+		struct Note {
+			decltype(usec)       requested;
+			const decltype(ready)& is_ready;
+			~Note() { WaitDebug::NoteWait(WaitDebug::CondRel, requested, !is_ready()); }
+		} note {usec, ready};
 		while (!ready()) {
 			const auto now = std::chrono::steady_clock::now();
 			if (now >= deadline) {
@@ -2918,6 +2930,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	if (!NativeCondDeadlineFromAbs(cond_value->clock_id, abstime, &deadline)) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	const auto requested_us = std::max<int64_t>(
+	    0, std::chrono::duration_cast<std::chrono::microseconds>(
+	           deadline - std::chrono::steady_clock::now())
+	           .count());
+	deadline = WaitDebug::ScaleDeadline(deadline);
 
 	if (mutex_value->owner != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
@@ -2952,6 +2969,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	result = (ready() ? OK : ETIMEDOUT);
+	WaitDebug::NoteWait(WaitDebug::CondAbs, static_cast<uint64_t>(requested_us), result != OK);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
 

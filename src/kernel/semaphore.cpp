@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/waitDebug.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -203,6 +204,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	if (!infinitely && micros == 0) {
 		return Result::TimedOut;
 	}
+	const uint32_t requested = micros;
+	micros                   = WaitDebug::ScaleUs(micros);
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
@@ -216,6 +219,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 		if ((elapsed >= micros && !infinitely)) {
 			RemoveWaiter(&waiter);
 			*ptr_micros = 0;
+			WaitDebug::NoteWait(WaitDebug::Sema, requested, true);
 			return Result::TimedOut;
 		}
 
@@ -227,7 +231,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	RemoveWaiter(&waiter);
 
 	if (ptr_micros != nullptr) {
-		*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
+		WaitDebug::NoteWait(WaitDebug::Sema, requested, false);
+		*ptr_micros = (elapsed >= micros ? 0 : (micros - elapsed) / WaitDebug::Scale());
 	}
 
 	return waiter.result;
@@ -386,11 +391,13 @@ public:
 
 		uint32_t      elapsed    = 0;
 		const bool    timed_wait = (micros != nullptr);
+		const auto    limit      = timed_wait ? LibKernel::WaitDebug::ScaleUs(*micros) : 0u;
 		Common::Timer timer;
 
 		while (m_count <= 0) {
-			if (timed_wait && elapsed >= *micros) {
+			if (timed_wait && elapsed >= limit) {
 				SyncGuest();
+				LibKernel::WaitDebug::NoteWait(LibKernel::WaitDebug::PosixSema, *micros, true);
 				return POSIX_ETIMEDOUT;
 			}
 
@@ -398,7 +405,7 @@ public:
 			SyncGuest();
 
 			if (timed_wait) {
-				m_cond_var.WaitFor(&m_mutex, *micros - elapsed);
+				m_cond_var.WaitFor(&m_mutex, limit - elapsed);
 			} else {
 				m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
 			}

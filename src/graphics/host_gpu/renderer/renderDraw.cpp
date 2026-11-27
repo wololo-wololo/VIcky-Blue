@@ -29,6 +29,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/waitDebug.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -1064,6 +1065,7 @@ struct DrawDumpFrame {
 	std::unique_ptr<Buffer> readback;
 	uint64_t                used    = 0;
 	uint64_t                skipped = 0;
+	uint64_t                timeouts = 0;
 	std::vector<Record>     records;
 };
 
@@ -1219,9 +1221,10 @@ void DrawDumpWrite(const DrawDumpFrame& frame, uint64_t index) {
 	if (file == nullptr) {
 		return;
 	}
-	std::fprintf(file, "frame %llu draws %zu skipped-copies %llu\n",
+	std::fprintf(file, "frame %llu draws %zu skipped-copies %llu timeouts %llu\n",
 	             static_cast<unsigned long long>(index), frame.records.size(),
-	             static_cast<unsigned long long>(frame.skipped));
+	             static_cast<unsigned long long>(frame.skipped),
+	             static_cast<unsigned long long>(frame.timeouts));
 	for (const auto& record: frame.records) {
 		std::fputs(record.text.c_str(), file);
 		uint32_t binding = 0;
@@ -1288,7 +1291,9 @@ uint64_t DrawDumpFlip(CommandScheduler& scheduler) {
 		dump.current.reset();
 		index = dump.frame++;
 	}
+	const uint64_t timeouts = Libs::LibKernel::WaitDebug::FrameTimeouts().exchange(0);
 	if (frame) {
+		frame->timeouts = timeouts;
 		scheduler.DeferOperation([frame, index] {
 			DrawDumpWrite(*frame, index);
 			auto&           dump = GetDrawDump();
