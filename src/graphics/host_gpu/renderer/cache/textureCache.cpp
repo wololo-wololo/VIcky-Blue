@@ -1694,7 +1694,7 @@ void TextureCache::PublishBcAliasWrites() {
 			                     });
 			// An image that cannot be downloaded leaves its aliases with their guest bytes, as
 			// BcAlias::Resolve leaves the image it was asked for.
-			if (aliases.empty() || !BcAlias::Publish(*this, image)) {
+			if (aliases.size() == 0 || !BcAlias::Publish(*this, image)) {
 				continue;
 			}
 			// Each alias, heap-selected or not, uploads the published bytes at its next refresh: an
