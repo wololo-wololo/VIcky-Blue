@@ -22,6 +22,8 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_map>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +33,7 @@
 #include <semaphore>
 #include <thread>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -68,6 +71,101 @@ struct FrameStats {
 		frame           = keep;
 	}
 } g_frame_stats;
+
+// Experiment (issue 22), KYTY_IB_CHECK: is any indirect command buffer the command processor
+// follows written by the GPU? Each one is noted when the command processor starts on it: whether
+// the buffer cache holds GPU data over it, and a hash of its contents. At every flip the GPU is
+// waited for (with a fault-buffer scan, so stores through device addresses are marked too), and
+// each buffer of the frame is checked again: written by the GPU since it was read, or changed.
+// A change without a GPU write can also be the guest CPU building its next frame in place.
+struct IbCheck {
+	struct Entry {
+		uint64_t address;
+		uint32_t num_dw;
+		uint64_t hash;
+		bool     gpu_at_read;
+	};
+	bool                                   enabled = std::getenv("KYTY_IB_CHECK") != nullptr;
+	std::vector<Entry>                     entries;
+	uint64_t                               frames = 0, buffers = 0, dwords = 0, gpu_at_read = 0,
+	         gpu_after_read = 0, changed = 0, changed_dwords = 0;
+	std::unordered_map<uint64_t, uint64_t> gpu_addresses;
+	std::unordered_map<uint64_t, uint64_t> changed_addresses;
+	int64_t                                last_report_ns = 0;
+
+	void Read(BufferCache& buffers_cache, const uint32_t* commands, uint32_t num_dw) {
+		const auto address = reinterpret_cast<uint64_t>(commands);
+		const auto size    = uint64_t {num_dw} * 4u;
+		// Before the hash: reading a GPU-modified page downloads it and clears the mark.
+		const bool gpu = buffers_cache.IsRegionGpuModified(address, size);
+		entries.push_back({address, num_dw, XXH3_64bits(commands, size), gpu});
+	}
+
+	static void Top(const char* what, std::unordered_map<uint64_t, uint64_t>& addresses) {
+		std::vector<std::pair<uint64_t, uint64_t>> top(addresses.begin(), addresses.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		if (top.size() > 6) {
+			top.resize(6);
+		}
+		std::fprintf(stderr, "ib check: %s:", what);
+		for (const auto& [address, count]: top) {
+			std::fprintf(stderr, " 0x%llx x%llu", static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(count));
+		}
+		std::fprintf(stderr, "\n");
+		addresses.clear();
+	}
+
+	void Flip(BufferCache& buffers_cache, CommandScheduler& scheduler) {
+		buffers_cache.ProcessFaultBuffer();
+		scheduler.Finish();
+		frames++;
+		for (const auto& entry: entries) {
+			const auto size = uint64_t {entry.num_dw} * 4u;
+			buffers++;
+			dwords += entry.num_dw;
+			gpu_at_read += entry.gpu_at_read ? 1u : 0u;
+			if (entry.gpu_at_read) {
+				gpu_addresses[entry.address]++;
+			}
+			if (buffers_cache.IsRegionGpuModified(entry.address, size)) {
+				gpu_after_read++;
+				gpu_addresses[entry.address]++;
+				continue;
+			}
+			if (XXH3_64bits(reinterpret_cast<const void*>(entry.address), size) != entry.hash) {
+				changed++;
+				changed_dwords += entry.num_dw;
+				changed_addresses[entry.address]++;
+			}
+		}
+		entries.clear();
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns != 0 && now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr,
+		             "ib check: %llu frames, %llu indirect buffers (%llu dw); GPU data at read %llu, "
+		             "GPU-written after read %llu; changed by the flip %llu (%llu dw)\n",
+		             static_cast<unsigned long long>(frames), static_cast<unsigned long long>(buffers),
+		             static_cast<unsigned long long>(dwords),
+		             static_cast<unsigned long long>(gpu_at_read),
+		             static_cast<unsigned long long>(gpu_after_read),
+		             static_cast<unsigned long long>(changed),
+		             static_cast<unsigned long long>(changed_dwords));
+		if (!gpu_addresses.empty()) {
+			Top("GPU-written buffers", gpu_addresses);
+		}
+		if (!changed_addresses.empty()) {
+			Top("changed buffers", changed_addresses);
+		}
+		frames = buffers = dwords = gpu_at_read = gpu_after_read = changed = changed_dwords = 0;
+	}
+} g_ib_check;
 
 } // namespace
 
@@ -603,6 +701,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
+	if (g_ib_check.enabled) {
+		g_ib_check.Read(m_renderer.GetBufferCache(), commands.data(),
+		                static_cast<uint32_t>(commands.size()));
+	}
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
@@ -1158,6 +1260,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
 	}
 	g_frame_stats.Flip();
+	if (g_ib_check.enabled) {
+		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
+	}
 	const auto dump_frame = DrawDumpFlip(GetScheduler());
 
 	auto& command = CurrentBuffer();
@@ -1174,6 +1279,9 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
 	}
 	g_frame_stats.Flip();
+	if (g_ib_check.enabled) {
+		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
+	}
 	const auto dump_frame = DrawDumpFlip(GetScheduler());
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
