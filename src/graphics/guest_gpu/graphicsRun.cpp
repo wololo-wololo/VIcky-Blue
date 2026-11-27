@@ -1152,6 +1152,15 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		return;
 	}
 
+	// Experiment (issue 22), KYTY_EARLY_IMAGE_READBACK: queued image copy-backs (render targets
+	// with --readback-linear-images / --readback-tiled-images) start before every end-of-pipe
+	// signal, not only at GL2 writebacks and the frame boundary. With --readback-storage-images
+	// guest accesses to their pages wait until the copies land.
+	static const bool early_image_readback = std::getenv("KYTY_EARLY_IMAGE_READBACK") != nullptr;
+	if (early_image_readback && !gl2_writeback) {
+		WriteBackImages();
+	}
+
 	// Experiment: pages written through device addresses become GPU-modified before the signal.
 	m_renderer.PublishGpuWrites();
 

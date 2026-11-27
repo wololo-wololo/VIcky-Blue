@@ -18,6 +18,9 @@
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/memory.h"
 
+#include <chrono>
+#include <cstdio>
+#include <map>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -2407,15 +2410,100 @@ bool TextureCache::WriteBackImages() {
 	return m_readback_storage_images && DownloadQueuedImages();
 }
 
+namespace {
+
+// Debug aid (issue 22), KYTY_READBACK_LOG: every two seconds, the images copied back to guest
+// memory since the last report, most frequent first.
+struct ReadbackLog {
+	struct Entry {
+		uint64_t size     = 0;
+		uint32_t width    = 0;
+		uint32_t height   = 0;
+		uint32_t layers   = 0;
+		uint32_t levels   = 0;
+		int      format   = 0;
+		int      guest    = 0;
+		bool     tiled    = false;
+		bool     target   = false;
+		bool     storage  = false;
+		uint64_t count    = 0;
+	};
+	bool                      enabled = std::getenv("KYTY_READBACK_LOG") != nullptr;
+	std::map<uint64_t, Entry> entries;
+	uint64_t                  calls = 0, downloads = 0, bytes = 0;
+	int64_t                   last_report_ns = 0;
+
+	void Report() {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns == 0) {
+			last_report_ns = now;
+			return;
+		}
+		if (now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr, "readback log: %llu queue drains, %llu image copy-backs, %.1f MiB, %zu images\n",
+		             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(downloads),
+		             static_cast<double>(bytes) / 1048576.0, entries.size());
+		std::vector<std::pair<uint64_t, Entry>> top(entries.begin(), entries.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+		if (top.size() > 16) {
+			top.resize(16);
+		}
+		for (const auto& [address, e]: top) {
+			std::fprintf(stderr,
+			             "readback log:   0x%llx x%llu %ux%u layers %u levels %u %s%s%s vk %d guest %d "
+			             "%llu B\n",
+			             static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(e.count), e.width, e.height, e.layers,
+			             e.levels, e.tiled ? "tiled" : "linear", e.target ? " target" : "",
+			             e.storage ? " shader-write" : "", e.format, e.guest,
+			             static_cast<unsigned long long>(e.size));
+		}
+		entries.clear();
+		calls = downloads = bytes = 0;
+	}
+} g_readback_log;
+
+} // namespace
+
 bool TextureCache::DownloadQueuedImages() {
 	std::scoped_lock lock {m_lock};
 	bool             downloaded = false;
+	auto&            log        = g_readback_log;
+	log.calls += log.enabled ? 1u : 0u;
 	for (const auto id: m_download_images) {
-		if (m_slot_images[id].IsGpuModified()) {
-			downloaded |= DownloadImageMemory(id);
+		auto& image = m_slot_images[id];
+		if (image.IsGpuModified()) {
+			const bool done = DownloadImageMemory(id);
+			downloaded |= done;
+			if (done && log.enabled) {
+				const auto& info  = image.info;
+				auto&       entry = log.entries[info.data.address];
+				entry.size        = info.data.size;
+				entry.width       = info.extent.width;
+				entry.height      = info.extent.height;
+				entry.layers      = info.resources.layers;
+				entry.levels      = info.resources.levels;
+				entry.format      = static_cast<int>(info.pixel_format);
+				entry.guest       = static_cast<int>(info.guest_format);
+				entry.tiled       = info.IsTiled();
+				entry.target      = image.usage.render_target;
+				entry.storage     = image.binding.shader_write;
+				entry.count++;
+				log.downloads++;
+				log.bytes += info.data.size;
+			}
 		}
 	}
 	m_download_images.clear();
+	if (log.enabled) {
+		log.Report();
+	}
 	return downloaded;
 }
 
