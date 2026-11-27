@@ -37,6 +37,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1223,6 +1224,35 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	// Experiment (issue 22), KYTY_DRAW_BARRIER: 1 makes the shader writes of draws whose vertex or
+	// pixel stages write buffers or storage images visible to all later commands, as dispatches
+	// do; 2 does it after every draw.
+	static const int draw_barrier = [] {
+		const char* value = std::getenv("KYTY_DRAW_BARRIER");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (draw_barrier != 0) {
+		const auto writes_images = [](const auto& program) {
+			return std::ranges::any_of(program.info.images, [](const auto& image) {
+				return image.written &&
+				       image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+			});
+		};
+		bool writes = shader_write_stages != vk::PipelineStageFlags {} ||
+		              (state.ps_active && writes_images(state.ps_input_info.stage.module->info));
+		for (const auto& stage: vertex_stages) {
+			writes |= writes_images(stage.stage.module->info);
+		}
+		if (draw_barrier >= 2 || writes) {
+			static uint64_t count = 0;
+			if (++count % 20000u == 1u) {
+				std::fprintf(stderr, "draw barrier: %llu barriers after draws (mode %d)\n",
+				             static_cast<unsigned long long>(count), draw_barrier);
+			}
+			buffer.EndRendering();
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eAllGraphics);
+		}
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

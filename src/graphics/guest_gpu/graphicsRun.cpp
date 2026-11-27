@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,43 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Debug aid (issue 22), KYTY_FRAME_STATS: one stderr line per flip with what the command
+// processors ran since the last one, to see whether a static scene's draw counts vary per frame.
+struct FrameStats {
+	bool     enabled = std::getenv("KYTY_FRAME_STATS") != nullptr;
+	uint64_t frame = 0, draws = 0, indexed = 0, zero_instances = 0, instances = 0, multi = 0,
+	         multi_draws = 0, multi_counted = 0, multi_zero = 0, multi_gpu = 0, dispatches = 0,
+	         dispatches_indirect = 0, async_dispatches = 0, predicated = 0;
+
+	void Flip() {
+		if (!enabled) return;
+		std::fprintf(stderr,
+		             "frame stats: %llu draws %llu (indexed %llu, instances %llu, zero-instance "
+		             "%llu) multi %llu (draws %llu, from count %llu, zero %llu, on GPU %llu) "
+		             "dispatches %llu (indirect %llu, async %llu) predicated-skip %llu\n",
+		             static_cast<unsigned long long>(frame++),
+		             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed),
+		             static_cast<unsigned long long>(instances),
+		             static_cast<unsigned long long>(zero_instances),
+		             static_cast<unsigned long long>(multi),
+		             static_cast<unsigned long long>(multi_draws),
+		             static_cast<unsigned long long>(multi_counted),
+		             static_cast<unsigned long long>(multi_zero),
+		             static_cast<unsigned long long>(multi_gpu),
+		             static_cast<unsigned long long>(dispatches),
+		             static_cast<unsigned long long>(dispatches_indirect),
+		             static_cast<unsigned long long>(async_dispatches),
+		             static_cast<unsigned long long>(predicated));
+		const auto keep = frame;
+		*this           = {};
+		frame           = keep;
+	}
+} g_frame_stats;
+
+} // namespace
 
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
@@ -608,6 +646,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			++g_frame_stats.predicated;
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
@@ -760,6 +799,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
+	++g_frame_stats.draws;
+	++g_frame_stats.indexed;
+	g_frame_stats.instances += args.instance_count;
+	g_frame_stats.zero_instances += args.instance_count == 0 ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
 }
 
@@ -831,7 +874,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+	++g_frame_stats.multi;
+	g_frame_stats.multi_draws += draw_count;
+	g_frame_stats.multi_counted += count_addr != nullptr ? 1u : 0u;
 	if (draw_count == 0) {
+		++g_frame_stats.multi_zero;
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
@@ -846,6 +893,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
 	if (IndirectDrawOffsets(registers, records.offsets)) {
 		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
+			++g_frame_stats.multi_gpu;
 			return;
 		}
 		if (indexed && m_index_buffer_size != 0 &&
@@ -853,6 +901,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                                         .index_addr          = IndexAddress(0),
 		                                         .index_type_and_size = m_index_type_and_size,
 		                                         .indirect            = records})) {
+			++g_frame_stats.multi_gpu;
 			return;
 		}
 	}
@@ -887,6 +936,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	++g_frame_stats.dispatches;
+	g_frame_stats.async_dispatches += IsAsyncComputeQueue() ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue());
 }
@@ -905,6 +956,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	++g_frame_stats.dispatches;
+	++g_frame_stats.dispatches_indirect;
+	g_frame_stats.async_dispatches += IsAsyncComputeQueue() ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }
@@ -914,6 +968,9 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
+	++g_frame_stats.draws;
+	g_frame_stats.instances += args.instance_count;
+	g_frame_stats.zero_instances += args.instance_count == 0 ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
 }
 
@@ -1100,6 +1157,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (AliasFlushEnabled()) {
 		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
 	}
+	g_frame_stats.Flip();
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
@@ -1112,6 +1170,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	if (AliasFlushEnabled()) {
 		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
 	}
+	g_frame_stats.Flip();
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
