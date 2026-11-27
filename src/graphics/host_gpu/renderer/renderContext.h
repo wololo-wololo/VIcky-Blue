@@ -58,7 +58,8 @@ public:
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
-	                               uint64_t fault_rip = 0, uint64_t fault_rsp = 0) noexcept;
+	                               uint64_t fault_rip = 0, uint64_t fault_rsp = 0,
+	                               uint64_t fault_rbp = 0) noexcept;
 	// Debug aid (issue 22), KYTY_WRITE_WATCH: re-arms the one-shot write watch at a guest flip.
 	void WriteWatchFlip();
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);

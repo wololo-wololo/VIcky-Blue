@@ -662,7 +662,7 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			uint32_t value = 0;
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
 			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
-			                                            info->exception_address, info->rsp)) {
+			                                            info->exception_address, info->rsp, info->rbp)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 				return true;
 			}
@@ -670,7 +670,7 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
-		                                            info->exception_address, info->rsp)) {
+		                                            info->exception_address, info->rsp, info->rbp)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}

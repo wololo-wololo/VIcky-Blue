@@ -212,7 +212,9 @@ struct BufferReadLog {
 // the code range those stack values must fall in (default: the main program's usual range).
 // KYTY_WRITE_WATCH_DEPTH=<n> walks the stack up to its readable end and keeps up to n values that
 // are return addresses (the bytes before them encode a call), instead of the first 4 code values
-// in 64 qwords.
+// in 64 qwords. KYTY_WRITE_WATCH_FP=1 instead follows the frame-pointer chain from the writer's
+// rbp ([rbp] is the caller's rbp, [rbp + 8] the return address), which lists only live frames; the
+// value at [rsp] is added first when it is a return address, for a writer without its own frame.
 struct WriteWatch {
 	struct Range {
 		uint64_t begin = 0;
@@ -237,6 +239,11 @@ struct WriteWatch {
 	size_t                                       depth = [] {
         const char* value = std::getenv("KYTY_WRITE_WATCH_DEPTH");
         return value == nullptr ? size_t {0} : static_cast<size_t>(std::strtoull(value, nullptr, 0));
+	}();
+
+	bool frame_pointers = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_FP");
+		return value != nullptr && value[0] == '1';
 	}();
 
 	// True when the code bytes before ret encode a call: E8 rel32, or FF /2 (with an optional REX
@@ -304,7 +311,7 @@ struct WriteWatch {
 		Report();
 	}
 
-	bool Note(PageManager& pages, uint64_t vaddr, uint64_t rip, uint64_t rsp) {
+	bool Note(PageManager& pages, uint64_t vaddr, uint64_t rip, uint64_t rsp, uint64_t rbp) {
 		const auto page = vaddr & ~0xfffull;
 		std::scoped_lock lock {mutex};
 		const auto it = armed.find(page);
@@ -315,7 +322,28 @@ struct WriteWatch {
 		pages.UpdatePageWatchers<false, false>(page, 0x1000);
 		faults++;
 		std::vector<uint64_t> key {rip};
-		if (rsp != 0 && depth > 0) {
+		if (frame_pointers && rsp != 0) {
+			const auto limit = depth > 0 ? depth : size_t {40};
+			if (LibKernel::Memory::ReadableHostBytes(rsp, 8) == 8) {
+				const auto top = *reinterpret_cast<const uint64_t*>(rsp);
+				if (top >= code.begin && top < code.end && IsReturnAddress(top)) {
+					key.push_back(top);
+				}
+			}
+			auto frame = rbp;
+			while (key.size() <= limit && frame >= rsp && (frame & 7u) == 0 &&
+			       LibKernel::Memory::ReadableHostBytes(frame, 16) == 16) {
+				const auto* slots = reinterpret_cast<const uint64_t*>(frame);
+				const auto  ret   = slots[1];
+				if (ret >= code.begin && ret < code.end) {
+					key.push_back(ret);
+				}
+				if (slots[0] <= frame || slots[0] - frame > 0x100000) {
+					break;
+				}
+				frame = slots[0];
+			}
+		} else if (rsp != 0 && depth > 0) {
 			const auto  bytes = LibKernel::Memory::ReadableHostBytes(rsp, 0x40000);
 			const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
 			for (uint64_t i = 0; i < bytes / 8 && key.size() <= depth; i++) {
@@ -365,7 +393,7 @@ struct WriteWatch {
 		std::vector<std::pair<std::vector<uint64_t>, Chain>> top(chains.begin(), chains.end());
 		std::sort(top.begin(), top.end(),
 		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
-		const size_t limit = depth > 0 ? 200 : 16;
+		const size_t limit = depth > 0 || frame_pointers ? 200 : 16;
 		for (size_t i = 0; i < top.size() && i < limit; i++) {
 			char   text[1024] = {};
 			size_t used      = 0;
@@ -586,7 +614,7 @@ void RenderContext::WriteWatchFlip() {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, uint64_t fault_rip,
-                                uint64_t fault_rsp) noexcept {
+                                uint64_t fault_rsp, uint64_t fault_rbp) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -594,7 +622,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, ui
 		return false;
 	}
 	if (access == PageFaultAccess::Write && g_write_watch.Enabled()) {
-		(void)g_write_watch.Note(m_page_manager, fault_vaddr, fault_rip, fault_rsp);
+		(void)g_write_watch.Note(m_page_manager, fault_vaddr, fault_rip, fault_rsp, fault_rbp);
 	}
 	// The access retries once the image write-backs over its page land.
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
