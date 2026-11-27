@@ -7,8 +7,81 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Debug aid: KYTY_UNMAP_TRACE=1 prints, once a second, how many guest unmaps went through the
+// GPU thread and how long the callers waited (queue wait, run time, full GPU waits).
+struct UnmapTrace {
+	std::atomic<uint64_t> count {0};
+	std::atomic<uint64_t> bytes {0};
+	std::atomic<uint64_t> wall_ns {0};
+	std::atomic<uint64_t> queue_ns {0};
+	std::atomic<uint64_t> run_ns {0};
+	std::atomic<uint64_t> finish_count {0};
+	std::atomic<uint64_t> finish_ns {0};
+	std::atomic<uint64_t> max_wall_ns {0};
+	std::atomic<int64_t>  last_print_ns {0};
+};
+
+UnmapTrace& GetUnmapTrace() {
+	static UnmapTrace trace;
+	return trace;
+}
+
+bool UnmapTraceEnabled() {
+	static const bool enabled = std::getenv("KYTY_UNMAP_TRACE") != nullptr;
+	return enabled;
+}
+
+int64_t NowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void RecordUnmap(uint64_t size, int64_t start, int64_t run_start, int64_t run_end, int64_t end,
+                 bool finished, int64_t finish_ns) {
+	auto&      trace = GetUnmapTrace();
+	const auto wall  = static_cast<uint64_t>(end - start);
+	trace.count.fetch_add(1, std::memory_order_relaxed);
+	trace.bytes.fetch_add(size, std::memory_order_relaxed);
+	trace.wall_ns.fetch_add(wall, std::memory_order_relaxed);
+	trace.queue_ns.fetch_add(static_cast<uint64_t>(run_start - start), std::memory_order_relaxed);
+	trace.run_ns.fetch_add(static_cast<uint64_t>(run_end - run_start), std::memory_order_relaxed);
+	if (finished) {
+		trace.finish_count.fetch_add(1, std::memory_order_relaxed);
+		trace.finish_ns.fetch_add(static_cast<uint64_t>(finish_ns), std::memory_order_relaxed);
+	}
+	auto max = trace.max_wall_ns.load(std::memory_order_relaxed);
+	while (wall > max && !trace.max_wall_ns.compare_exchange_weak(max, wall)) {
+	}
+	auto last = trace.last_print_ns.load(std::memory_order_relaxed);
+	if (end - last < 1'000'000'000 || !trace.last_print_ns.compare_exchange_strong(last, end)) {
+		return;
+	}
+	const auto count = trace.count.exchange(0);
+	std::fprintf(stderr,
+	             "unmap trace: n=%llu bytes=%llu wall_ms=%.1f queue_ms=%.1f run_ms=%.1f "
+	             "finish_n=%llu finish_ms=%.1f max_ms=%.2f\n",
+	             static_cast<unsigned long long>(count),
+	             static_cast<unsigned long long>(trace.bytes.exchange(0)),
+	             static_cast<double>(trace.wall_ns.exchange(0)) / 1e6,
+	             static_cast<double>(trace.queue_ns.exchange(0)) / 1e6,
+	             static_cast<double>(trace.run_ns.exchange(0)) / 1e6,
+	             static_cast<unsigned long long>(trace.finish_count.exchange(0)),
+	             static_cast<double>(trace.finish_ns.exchange(0)) / 1e6,
+	             static_cast<double>(trace.max_wall_ns.exchange(0)) / 1e6);
+	std::fflush(stderr);
+}
+
+} // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -128,22 +201,41 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto unmap = [this, vaddr, size] {
+	const bool trace     = UnmapTraceEnabled();
+	const auto start     = trace ? NowNs() : 0;
+	int64_t    run_start = 0;
+	int64_t    run_end   = 0;
+	int64_t    finish_ns = 0;
+	bool       finished  = false;
+	const auto unmap     = [&, this, vaddr, size] {
+		if (trace) {
+			run_start = NowNs();
+		}
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
 		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
 		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
+			const auto finish_start = trace ? NowNs() : 0;
+			const auto tick         = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (trace) {
+				finished  = true;
+				finish_ns = NowNs() - finish_start;
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.Subtract(vaddr, size);
+		}
+		if (trace) {
+			run_end = NowNs();
+		}
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -152,6 +244,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+	if (trace) {
+		RecordUnmap(size, start, run_start, run_end, NowNs(), finished, finish_ns);
+	}
 }
 
 void RenderContext::PrepareBda() {
