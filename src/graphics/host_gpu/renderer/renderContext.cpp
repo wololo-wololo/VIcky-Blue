@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -106,6 +108,66 @@ void RecordUnmap(uint64_t size, int64_t start, int64_t run_start, int64_t run_en
 }
 
 } // namespace
+
+// Debug aid (issue 22), KYTY_BUFFER_READ_LOG: guest CPU read faults on pages whose buffer data
+// the GPU wrote (the first CPU read after each GPU write). One line per draw dump frame with the
+// count and the top reading instructions with their page addresses.
+struct BufferReadLog {
+	struct Site {
+		uint64_t count = 0;
+		uint64_t page  = 0;
+		uint64_t pages = 0;
+	};
+	bool                               enabled = std::getenv("KYTY_BUFFER_READ_LOG") != nullptr;
+	std::mutex                         mutex;
+	uint64_t                           frame = 0, gpu_reads = 0, other_reads = 0;
+	std::unordered_map<uint64_t, Site> sites;
+
+	void FlushLocked() {
+		if (gpu_reads + other_reads == 0) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, Site>> top(sites.begin(), sites.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+		char   text[1200] = {};
+		size_t used       = 0;
+		for (size_t i = 0; i < top.size() && i < 12 && used < sizeof(text) - 80; i++) {
+			const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx:%llu@0x%llx",
+			                            static_cast<unsigned long long>(top[i].first),
+			                            static_cast<unsigned long long>(top[i].second.count),
+			                            static_cast<unsigned long long>(top[i].second.page));
+			if (n < 0) {
+				break;
+			}
+			used += static_cast<size_t>(n);
+		}
+		std::fprintf(stderr, "buffer read log: frame %llu gpu-data reads %llu other %llu sites %zu%s\n",
+		             static_cast<unsigned long long>(frame),
+		             static_cast<unsigned long long>(gpu_reads),
+		             static_cast<unsigned long long>(other_reads), sites.size(), text);
+		gpu_reads = other_reads = 0;
+		sites.clear();
+	}
+
+	void Note(uint64_t vaddr, uint64_t rip, bool gpu_data) {
+		const auto current = DrawDumpFrameIndex();
+		std::scoped_lock lock {mutex};
+		if (current != frame) {
+			FlushLocked();
+			frame = current;
+		}
+		if (!gpu_data) {
+			other_reads++;
+			return;
+		}
+		gpu_reads++;
+		auto& site = sites[rip];
+		if (site.count++ == 0) {
+			site.page = vaddr & ~0xfffull;
+		}
+	}
+} g_buffer_read_log;
 
 bool AliasLogNote(AliasUse use, uint64_t vaddr, uint64_t size) {
 	if (!LibKernel::Memory::AliasLogEnabled() || size == 0) {
@@ -330,6 +392,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		if (g_buffer_read_log.enabled) {
+			g_buffer_read_log.Note(fault_vaddr, fault_rip,
+			                       m_buffer_cache.IsRegionGpuModified(fault_vaddr, fault_size));
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
