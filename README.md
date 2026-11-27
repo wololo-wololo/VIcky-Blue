@@ -123,7 +123,7 @@ one up.
 
 Report only problems that affect the target title, include the commit you tested, and scrub the
 title's name and any dump paths from logs and screenshots before attaching them. Never attach
-game files.
+game files. [Capturing a boot log for an issue](#capturing-a-boot-log-for-an-issue) explains how.
 
 ## Contributing
 
@@ -136,6 +136,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first. In short:
 Keep each pull request focused on one problem the target title hits. Describe the exact
 problem and show evidence of what the change fixes, such as a scrubbed log excerpt. Changes
 with no benefit to the target title should go upstream instead.
+
+### AI Use
+
+AI tools may be used freely, including for writing code, tests, documentation, commit messages
+and pull-request descriptions. Contributors must understand, review and test everything they
+submit and remain responsible for its correctness. Everything else in
+[CONTRIBUTING.md](CONTRIBUTING.md) applies to AI-assisted work as well.
 
 ### Formatting
 
@@ -173,9 +180,20 @@ the Vulkan/SPIR-V validation rules.
 
 ## Building
 
+The build is unchanged from upstream KytyPS5, and so are these instructions, apart from the notes
+on what this fork tests. **Windows is the only platform this fork builds and tests**: CI
+([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds and runs the regression tests
+on Windows only. The Linux, NixOS, Fedora and macOS sections below are kept as upstream wrote them
+for anyone who wants to try; they are not tested here, and problems that only occur there are not
+tracked.
+
+The fork publishes no releases or prebuilt packages. Build from source; to update, pull `main` and
+rebuild.
+
 ### System requirements
 
-- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
+- Windows 10 version 1803 or newer (the Linux and macOS requirements are upstream's, untested
+  here: a current Linux distribution, or macOS on Apple Silicon)
 - A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
 - A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
   MoltenVK)
@@ -214,9 +232,12 @@ cmake --install _Build/windows --prefix _Build/windows/install
 ```
 
 The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
+`_Build/windows/install`. To build only the emulator, use `--target kyty_emulator`; it ends up in
+`_Build/windows`.
 
 ### Building on Linux
+
+*Upstream instructions, not tested by this fork.*
 
 Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland, and
 udev development packages, SDL3 quietly configures itself without those backends, and the resulting
@@ -268,6 +289,8 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
+*Upstream instructions, not tested by this fork.*
+
 A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
 libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
 `CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
@@ -290,6 +313,8 @@ inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
 `hardware.graphics.enable = true`).
 
 ### Building on Fedora and Fedora Atomic (Bazzite, Bluefin, Silverblue)
+
+*Upstream instructions, not tested by this fork.*
 
 On regular Fedora, install dependencies on the host. On Fedora Atomic variants such as Bazzite,
 Bluefin and Silverblue, use [Distrobox](https://distrobox.it/) and run the install and build steps
@@ -328,9 +353,10 @@ if its other system libraries are compatible with the container build.
 
 ### Building on macOS
 
+*Upstream instructions, not tested by this fork.*
+
 macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
-code executes through the same translation layer as the emulator itself. Prebuilt archives are
-attached to releases; the steps below are for building from source.
+code executes through the same translation layer as the emulator itself.
 
 Requirements:
 
@@ -369,8 +395,6 @@ codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/l
 codesign --force --sign - _Build/macos/install/KytyPS5.app
 ```
 
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
-
 ### Regression tests
 
 Build every regression executable and run the registered tests with:
@@ -403,7 +427,85 @@ Before using it:
 
 Update your graphics driver before reporting rendering problems.
 
-To use the graphical launcher:
+### Running the target title
+
+The target title is started from a shell, not from the launcher, because it needs environment
+variables that the launcher does not set. In PowerShell, from the repository root:
+
+```powershell
+$env:KYTY_LARGE_MEMORY = '1'
+$env:KYTY_RAW_PATCH = '847c4d7:7413:9090,847c411:0f83cd000000:909090909090'
+$env:KYTY_SKIP_SHADERS = '05dc60d7ff9e4fce'
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\TargetTitle" --shader-cache
+```
+
+`--game` takes the dump folder (the one containing `eboot.bin`), a ZArchive (`.zar`) dump whose
+root contains `eboot.bin`, or an ELF file. Use only a dump of your own legally obtained copy.
+
+- The title stops at its first screen, an almost empty dark screen with a small "CONTINUE (X)"
+  prompt in the bottom-right corner, until Cross is pressed. Press it once; everything after
+  that advances on its own.
+- A first boot compiles every shader and can sit at a black window or 0 fps for a long time.
+  That is not a hang. With `--shader-cache` the next boot reuses the compiled shaders.
+
+The environment variables are specific to this fork:
+
+| Variable | Value | What it does |
+| --- | --- | --- |
+| `KYTY_LARGE_MEMORY` | `1` | Adds 1216 MiB to the guest memory budget, the PS5 Pro budget, for a dump whose metadata does not enable Pro mode. The target title runs out of guest memory without it ([#9](https://github.com/wololo-wololo/VIcky-Blue/issues/9)). Any other value, or leaving it unset, keeps the normal budget. |
+| `KYTY_RAW_PATCH` | `<offset>:<expected>:<new>[,...]` | Debug aid that patches the main executable after it is loaded, without any title metadata. Each entry is a hex offset from the executable's base, the hex bytes expected there and the hex bytes to write; both byte strings must have the same even length. An entry is applied only when the expected bytes match, and the log says `Raw patch at +0x...: applied` or `expected bytes not found, skipped`. Malformed entries are ignored without a message. The value above is a temporary workaround that disables the title's main-loop watchdog ([#14](https://github.com/wololo-wololo/VIcky-Blue/issues/14)). |
+| `KYTY_SKIP_SHADERS` | `<hex hash>[,...]` | Debug aid that drops every draw or dispatch using one of the listed guest shaders. The value above is a temporary workaround for a host GPU device loss ([#13](https://github.com/wololo-wololo/VIcky-Blue/issues/13)). |
+
+The workarounds and the issues that track them are listed under [Current Status](#current-status);
+when one is removed there, remove it here too.
+
+Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
+debugging options.
+
+### Capturing a boot log for an issue
+
+The emulator writes its log to standard output. Keep it in a file by starting the emulator with
+redirected output (set the environment variables first, as above):
+
+```powershell
+Start-Process .\_Build\windows\install\kyty_emulator.exe -ArgumentList '--game', '"D:\Games\TargetTitle"', '--shader-cache' -RedirectStandardOutput boot.log -RedirectStandardError boot-stderr.log
+```
+
+Avoid `> boot.log` in Windows PowerShell 5.1: it writes the file as UTF-16, which the triage
+script does not parse. On Linux, `kyty_emulator --game ... > boot.log 2>&1` is fine.
+
+Then turn the log into a report:
+
+```sh
+python scripts/triage-log.py boot.log
+```
+
+The report lists the fatal error, unimplemented library functions, skipped shaders, sampler
+fallbacks and event waits that never complete. It is already scrubbed: paths and the program
+name are removed and only derived facts (messages, symbol ids, shader hashes, counts) are kept.
+Paste the report into the issue. Collaborators can file it directly with `--file-issues`; see
+[Reporting what you find](CONTRIBUTING.md#reporting-what-you-find).
+
+**Never attach the raw log.** It contains the dump's path, which usually names the target title. When an
+issue needs lines the report does not cover, copy only those lines and scrub them by hand:
+
+- replace drive and home-directory paths, dump folder names and user names with `<path>`;
+- remove the target title's name and its window title wherever they appear;
+- crop the window title bar out of screenshots.
+
+Check the excerpt before posting it:
+
+```sh
+scripts/policy-check.sh text < excerpt.txt
+```
+
+It catches the title's name, not paths, so the hand scrub is still needed.
+
+### Other games and the launcher
+
+The graphical launcher is inherited from upstream and is kept for other games, which are out of
+scope here. It does not set the environment variables above, so it is not the way to start the
+target title.
 
 ```powershell
 .\_Build\windows\install\kyty_launcher.exe
@@ -422,62 +524,31 @@ folders recursively for game directories containing `eboot.bin` and ZArchive (`.
 whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
 ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
-Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
-or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
-for your platform from GitHub, checks its SHA-256 checksum, and restarts after installation. Close
-any running games first. Settings, saves, patches, and other files outside the release package are
-preserved; replacement failures restore the previous files. The installation folder must be writable.
-If a package cannot be installed automatically, the updater offers the GitHub release page.
-Source builds and builds from forks do not replace themselves with official releases.
+The launcher's built-in updater only replaces official upstream KytyPS5 release builds. A build
+of this fork never updates itself; pull `main` and rebuild instead.
 
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
-ZArchive dump:
-
-```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
-```
-
-```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
-```
-
-On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
+On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically. To
+override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
 
 ```bash
 SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
-
-### AI Use
-
-AI tools may be used freely, including for writing code, tests, documentation, commit messages
-and pull-request descriptions. Contributors must understand, review and test everything they
-submit and remain responsible for its correctness. Everything else in
-[CONTRIBUTING.md](CONTRIBUTING.md) applies to AI-assisted work as well.
-
 ## License
 
 VIcky-Blue, like KytyPS5, is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
+(`GPL-2.0-only`). Most of the code is upstream KytyPS5's and keeps its authors' copyright; this
+fork's changes are released under the same license.
 
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
+KytyPS5 is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
 under the MIT License. Kyty's original copyright and license notice are preserved in
 [`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
 licenses included with those components.
 
 ## Special Thanks
 
+- [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5) — the emulator this fork is built on.
+  Everything here except the single-title work is theirs; general fixes belong there.
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
