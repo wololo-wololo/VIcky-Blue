@@ -7,7 +7,8 @@
 **VIcky-Blue is a single-title project.** It is a fork of
 [KytyPS5](https://github.com/KytyPS5/KytyPS5), a free and open-source PlayStation 5 translation
 layer written in C++, and it exists to get one specific PlayStation 5 game running. It is not a
-general-purpose emulator and does not try to be one.
+general-purpose emulator and does not try to be one. The measure of success is quality: the
+target title running exactly as it is meant to be played, not just booting.
 
 > [!IMPORTANT]
 > **The target title is never named in this repository.** Not in code, comments, commit
@@ -19,6 +20,11 @@ general-purpose emulator and does not try to be one.
 
 - **One game decides everything.** Work is prioritised by what the target title needs to boot,
   render and run. A fix is in scope when it moves that title forward.
+- **The goal is the title as it is meant to be played.** Booting and reaching the next screen
+  is a step, not the finish line. The aim is correct rendering, audio, timing and input, matching
+  how the title runs on the console, with no missing effects, wrong frame pacing or skipped
+  content. A workaround that gets further but changes what the player sees or hears is
+  temporary debt to be removed.
 - **Other games are out of scope.** They may work, since the upstream code is still here, but
   compatibility with them is not tested, not tracked and not a reason to accept or reject a
   change. Regressions in other titles are acceptable when the target title benefits.
