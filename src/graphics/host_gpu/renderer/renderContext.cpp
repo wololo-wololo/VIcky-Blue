@@ -215,6 +215,12 @@ struct BufferReadLog {
 // in 64 qwords. KYTY_WRITE_WATCH_FP=1 instead follows the frame-pointer chain from the writer's
 // rbp ([rbp] is the caller's rbp, [rbp + 8] the return address), which lists only live frames; the
 // value at [rsp] is added first when it is a return address, for a writer without its own frame.
+// KYTY_WRITE_WATCH_PTR=<slot>[,<slot>...] watches data reached through pointers: at every flip the
+// qword at each slot is read as an address, the pages of the bit array there are armed too, and a
+// line gives the frame, the address, the set bits and a hash of the array. The array holds
+// KYTY_WRITE_WATCH_PTR_BITS=<n> bits, or as many as the dword at KYTY_WRITE_WATCH_PTR_COUNT=<addr>
+// says. A first write inside an array is reported as range 100 + the slot's index; one elsewhere on
+// its pages as range 90 + the index.
 struct WriteWatch {
 	struct Range {
 		uint64_t begin = 0;
@@ -239,6 +245,35 @@ struct WriteWatch {
 	size_t                                       depth = [] {
         const char* value = std::getenv("KYTY_WRITE_WATCH_DEPTH");
         return value == nullptr ? size_t {0} : static_cast<size_t>(std::strtoull(value, nullptr, 0));
+	}();
+
+	struct Pointer {
+		uint64_t slot   = 0;
+		uint64_t target = 0;
+		uint64_t bytes  = 0;
+		uint64_t writes = 0;
+	};
+	std::vector<Pointer> pointers = [] {
+		std::vector<Pointer> list;
+		const char*          text = std::getenv("KYTY_WRITE_WATCH_PTR");
+		while (text != nullptr && *text != '\0') {
+			char*      end  = nullptr;
+			const auto slot = std::strtoull(text, &end, 0);
+			if (end == text) {
+				break;
+			}
+			list.push_back({slot});
+			text = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+	uint64_t pointer_bits = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_PTR_BITS");
+		return value == nullptr ? uint64_t {0} : std::strtoull(value, nullptr, 0);
+	}();
+	uint64_t pointer_count = [] {
+		const char* value = std::getenv("KYTY_WRITE_WATCH_PTR_COUNT");
+		return value == nullptr ? uint64_t {0} : std::strtoull(value, nullptr, 0);
 	}();
 
 	bool frame_pointers = [] {
@@ -288,27 +323,82 @@ struct WriteWatch {
 		return list;
 	}
 
-	[[nodiscard]] bool Enabled() const { return !ranges.empty(); }
+	[[nodiscard]] bool Enabled() const { return !ranges.empty() || !pointers.empty(); }
 
 	template <typename IsMapped>
 	void Flip(PageManager& pages, IsMapped&& is_mapped) {
 		std::scoped_lock lock {mutex};
 		flips++;
+		const auto arm = [&](uint64_t page) {
+			auto [it, inserted] = armed.try_emplace(page, true);
+			if (!inserted && it->second) {
+				return;
+			}
+			if (!is_mapped(page)) {
+				armed.erase(it);
+				return;
+			}
+			it->second = true;
+			pages.UpdatePageWatchers<true, false>(page, 0x1000);
+		};
 		for (const auto& range: ranges) {
 			for (auto page = range.begin; page < range.end; page += 0x1000) {
-				auto [it, inserted] = armed.try_emplace(page, true);
-				if (!inserted && it->second) {
-					continue;
-				}
-				if (!is_mapped(page)) {
-					armed.erase(it);
-					continue;
-				}
-				it->second = true;
-				pages.UpdatePageWatchers<true, false>(page, 0x1000);
+				arm(page);
 			}
 		}
+		FlipPointers(arm);
 		Report();
+	}
+
+	template <typename Arm>
+	void FlipPointers(Arm&& arm) {
+		if (pointers.empty()) {
+			return;
+		}
+		uint64_t bits = pointer_bits;
+		if (pointer_count != 0 && LibKernel::Memory::ReadableHostBytes(pointer_count, 4) == 4) {
+			bits = *reinterpret_cast<const uint32_t*>(pointer_count);
+		}
+		bits = std::min<uint64_t>(bits, 0x10000);
+		for (size_t i = 0; i < pointers.size(); i++) {
+			auto& pointer = pointers[i];
+			if (LibKernel::Memory::ReadableHostBytes(pointer.slot, 8) != 8) {
+				continue;
+			}
+			pointer.target = *reinterpret_cast<const uint64_t*>(pointer.slot);
+			pointer.bytes  = (bits + 7) / 8;
+			if (pointer.target == 0 || pointer.bytes == 0) {
+				continue;
+			}
+			if (LibKernel::Memory::ReadableHostBytes(pointer.target, pointer.bytes) != pointer.bytes) {
+				// Read-protected, for example while the buffer cache holds GPU-written data there.
+				std::fprintf(stderr, "write watch ptr: frame %llu slot %zu at 0x%llx unreadable\n",
+				             static_cast<unsigned long long>(DrawDumpFrameIndex()), i,
+				             static_cast<unsigned long long>(pointer.target));
+				continue;
+			}
+			std::vector<uint8_t> data(pointer.bytes);
+			std::memcpy(data.data(), reinterpret_cast<const void*>(pointer.target), pointer.bytes);
+			if ((bits & 7u) != 0) {
+				data.back() &= static_cast<uint8_t>((1u << (bits & 7u)) - 1u);
+			}
+			uint64_t set = 0;
+			for (const auto byte: data) {
+				set += static_cast<uint64_t>(std::popcount(byte));
+			}
+			std::fprintf(stderr,
+			             "write watch ptr: frame %llu slot %zu at 0x%llx bits %llu/%llu hash %016llx cpu-writes "
+			             "%llu\n",
+			             static_cast<unsigned long long>(DrawDumpFrameIndex()), i,
+			             static_cast<unsigned long long>(pointer.target), static_cast<unsigned long long>(set),
+			             static_cast<unsigned long long>(bits),
+			             static_cast<unsigned long long>(XXH3_64bits(data.data(), data.size())),
+			             static_cast<unsigned long long>(pointer.writes));
+			pointer.writes = 0;
+			for (auto page = pointer.target & ~0xfffull; page < pointer.target + pointer.bytes; page += 0x1000) {
+				arm(page);
+			}
+		}
 	}
 
 	bool Note(PageManager& pages, uint64_t vaddr, uint64_t rip, uint64_t rsp, uint64_t rbp) {
@@ -366,6 +456,15 @@ struct WriteWatch {
 			if (page >= ranges[i].begin && page < ranges[i].end) {
 				range_index = static_cast<int>(i);
 			}
+		}
+		for (size_t i = 0; i < pointers.size(); i++) {
+			auto& pointer = pointers[i];
+			if (pointer.bytes == 0 || page != (pointer.target & ~0xfffull)) {
+				continue;
+			}
+			const bool inside = vaddr >= pointer.target && vaddr < pointer.target + pointer.bytes;
+			range_index       = static_cast<int>((inside ? 100 : 90) + i);
+			pointer.writes += inside ? 1 : 0;
 		}
 		auto& chain = chains[key];
 		if (chain.count++ == 0) {
