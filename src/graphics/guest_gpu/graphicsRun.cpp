@@ -1106,7 +1106,20 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(label);
+	// Keep running queued GPU-thread commands while this packet waits for the flip. Other threads
+	// send guest memory unmaps here synchronously; blocking for the whole flip held each of them
+	// for up to a frame and slowed the title's streaming loads to a crawl. ProcessPm4 already runs
+	// these commands between packets. Debug aid: KYTY_FLIP_WAIT_BLOCKING=1 restores the old wait.
+	static const bool run_commands = std::getenv("KYTY_FLIP_WAIT_BLOCKING") == nullptr;
+	auto&             video_out    = m_renderer.GetVideoOut();
+	if (!run_commands || g_gpu_state == nullptr) {
+		video_out.WaitFlipDone(label);
+		return;
+	}
+	g_gpu_state->ProcessCommands();
+	while (!video_out.WaitFlipDoneFor(label, 1000)) {
+		g_gpu_state->ProcessCommands();
+	}
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
