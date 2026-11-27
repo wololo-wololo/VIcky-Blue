@@ -312,18 +312,19 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
-// TEMPORARY WORKAROUND: a program that specialized before can meet descriptor tables that no
-// longer do, for instance rows the guest rewrote or has not filled yet. That dispatch or draw is
-// dropped, like a first-time failure, but the program stays usable for the next one.
+// TEMPORARY WORKAROUND: a compute program that specialized before can meet descriptor tables
+// that no longer do, for instance rows the guest rewrote or has not filled yet. That dispatch is
+// dropped, like a first-time failure, but the program stays usable for the next one. Graphics
+// stages still stop here.
 const ShaderModule* PipelineCache::SkipRespecialization(Program& program, uint64_t hash,
                                                         ShaderType stage) {
+	EXIT_IF(stage != ShaderType::Compute);
 	if (!program.respecialization_reported) {
 		program.respecialization_reported = true;
-		PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
+		PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
 		                 "reason=resource specialization failed on a later use; rendering is "
 		                 "incomplete",
-		                 stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW", hash,
-		                 static_cast<int>(stage));
+		                 hash);
 	}
 	return nullptr;
 }
@@ -441,13 +442,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto& program = entry->second;
 		if (!ShaderRecompiler::IR::MaterializeResources(
 		        program.resource_plan, runtime, program.resources, program.specialization)) {
-			// TEMPORARY WORKAROUND: a shader whose resources cannot be specialized is skipped
-			// like an unsupported callable target. A compute shader drops its dispatch; any
-			// other stage drops every draw that uses it (see GetGraphicsPrograms).
-			PipelineCacheLog("!!! TEMPORARY {} SKIP !!! shader=0x{:016x} stage={} "
+			// A compute shader whose resources cannot be specialized is skipped like an
+			// unsupported callable target; graphics stages still stop here.
+			EXIT_IF(options.stage != ShaderType::Compute);
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
 			                 "reason=resource specialization failed; rendering is incomplete",
-			                 options.stage == ShaderType::Compute ? "COMPUTE DISPATCH" : "DRAW",
-			                 params.hash, static_cast<int>(options.stage));
+			                 params.hash);
 			program.skip_dispatch = true;
 			return nullptr;
 		}
@@ -866,7 +866,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	if (pixel_active) {
 		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data);
 		if (pixel_program == nullptr) {
-			// Skipped pixel program: a null first vertex module makes the caller drop the draw.
+			// Debug-skipped pixel program (KYTY_SKIP_SHADERS): a null first vertex module makes
+			// the caller drop the draw.
 			vertex_info[0].stage = {};
 			return;
 		}

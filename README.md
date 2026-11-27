@@ -56,11 +56,11 @@ Known state:
     has no title id and stores them under the name `UNKNOWN`
     ([#27](https://github.com/wololo-wololo/VIcky-Blue/issues/27)). The first boot still compiles
     everything; with a complete cache the warm-up before the first frame took 30 s.
-- Compute dispatches and, new, draws whose shader resources cannot be tracked or specialized are
-  skipped by a temporary workaround, which is the main reason the image is incomplete
-  ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2), [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3), [#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)). The failures seen are GPU-selected buffer
-  descriptors, indirect buffer tables over the 65536-row limit, and atomic image operations on
-  32_32Float and other non-32-bit-integer images (the last now specialize, see below).
+- Compute dispatches whose shader resources cannot be tracked or specialized are skipped by a
+  temporary workaround ([#2](https://github.com/wololo-wololo/VIcky-Blue/issues/2)). Draws used
+  to skip on specialization failures too
+  ([#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)), which was part of why the image
+  was incomplete.
   - GPU-selected descriptors read with typed (`tbuffer_load_format_x/xy/xyz/xyzw`) loads now
     translate. In a boot to the intro the number of distinct skipped shaders went from 231 to
     26 (4 resource tracking failures, 22 specialization failures). What is left on the tracking
@@ -93,9 +93,11 @@ Known state:
     The 8- and 16-bit images run their atomics on an R32_UINT shadow image that is filled before
     each draw or dispatch and written back after it; this costs two extra compute copies per such
     draw. A run into the intro no longer reports an "atomic image descriptor ... uses unsupported
-    format" skip. Multisampled 8- and 16-bit atomic images are still skipped. The "resource
-    specialization failed" skip stays a non-fatal workaround: the indirect formatted store
-    failures of [#3](https://github.com/wololo-wololo/VIcky-Blue/issues/3) still reach it.
+    format" skip. Multisampled 8- and 16-bit atomic images are still rejected by specialization.
+    A run into the intro sequence now hits zero `TEMPORARY DRAW SKIP` or
+    `TEMPORARY COMPUTE DISPATCH SKIP` lines, and graphics resource specialization failures are
+    fatal again ([#15](https://github.com/wololo-wololo/VIcky-Blue/issues/15)); the compute
+    specialization skip stays a non-fatal workaround.
 - Two system library functions the title calls are not implemented yet
   ([#5](https://github.com/wololo-wololo/VIcky-Blue/issues/5), [#6](https://github.com/wololo-wololo/VIcky-Blue/issues/6)).
 - The title needs `KYTY_LARGE_MEMORY=1` set to get enough guest memory ([#9](https://github.com/wololo-wololo/VIcky-Blue/issues/9)).

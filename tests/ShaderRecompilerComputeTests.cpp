@@ -51774,6 +51774,99 @@ void CheckComputeQueueModules(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Graphics resource specialization failure is fatal on both first use and respecialization.
+[[noreturn]] void RunGraphicsSpecializationDeathCase(VulkanHarness &vulkan, const char *kind) {
+  constexpr uintptr_t base = 0x0000000208000000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  auto &context = vulkan.RuntimeRenderer();
+  auto &cache = context.GetPipelineCache();
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require("GraphicsSpecializationFatal", "memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "direct-memory allocation or mapping failed");
+  // s_load_dwordx8 s[8:15], s[0:1], 0x0; v_mov_b32 v20..v22, 0;
+  // v_mov_b32 v0, 1; image_atomic_add v0, v[20:22], s[8:15] glc; exp mrt0 v0..v0; s_endpgm
+  std::vector<u32> pixel{EncodeSmem0(0x03u, 8, 0), EncodeSmem1(0, 125)};
+  AppendVMovU32(&pixel, 20, 0);
+  AppendVMovU32(&pixel, 21, 0);
+  AppendVMovU32(&pixel, 22, 0);
+  AppendVMovU32(&pixel, 0, 1);
+  pixel.push_back(EncodeMimg0(0x11u, 0x1u, 0, true));
+  pixel.push_back(EncodeMimg1(0, 20, 2));
+  pixel.push_back(EncodeExp0(0x00u, 0xfu));
+  pixel.push_back(EncodeExp1(0, 0, 0, 0));
+  AppendEnd(&pixel);
+  const auto make_sharp = [&](Prospero::BufferFormat format) {
+    const uint64_t image_addr = base + 0x2000;
+    return ShaderTextureResource{
+        {static_cast<u32>(image_addr >> 8u),
+         (static_cast<u32>(format) << 20u) | (3u << 30u),
+         (3u << 14u),
+         DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+             (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+         0, 0x00700000u, 0, 0}};
+  };
+  const ShaderParams params{.code = pixel,
+                            .user_data = {static_cast<u32>(base), static_cast<u32>(base >> 32u)},
+                            .user_data_count = 2,
+                            .hash = 0x1500000000000001ull};
+  const auto lookup = [&] {
+    ShaderPixelInputInfo input{};
+    return PipelineCacheTestAccess::GetProgram(cache, params, input);
+  };
+  if (std::strcmp(kind, "first-use") == 0) {
+    const auto unsupported = make_sharp(Prospero::BufferFormat::k11_11_10UInt);
+    LibKernel::Memory::WriteBacking(base, unsupported.fields, sizeof(unsupported.fields));
+    (void)lookup();
+    std::exit(1);
+  }
+  const auto valid = make_sharp(Prospero::BufferFormat::k32UInt);
+  LibKernel::Memory::WriteBacking(base, valid.fields, sizeof(valid.fields));
+  Require("GraphicsSpecializationFatal", "initial specialization", lookup() != nullptr,
+          "valid graphics atomic image did not specialize");
+  const auto unsupported = make_sharp(Prospero::BufferFormat::k11_11_10UInt);
+  LibKernel::Memory::WriteBacking(base, unsupported.fields, sizeof(unsupported.fields));
+  (void)lookup();
+  std::exit(1);
+}
+
+void CheckGraphicsSpecializationFatal(VulkanHarness &vulkan) {
+  constexpr const char *name = "GraphicsSpecializationFatal";
+  for (const char *kind : {"first-use", "respecialize"}) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    char path[MAX_PATH]{};
+    Require(name, "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+            "GetModuleFileName failed");
+    std::string command =
+        std::string("\"") + path + "\" --graphics-specialization-death " + kind;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    Require(name, "host",
+            CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0,
+            "CreateProcess failed");
+    Require(name, "host", WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0,
+            "graphics specialization death case timed out");
+    DWORD exit_code = 0;
+    const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Require(name, kind, exited && exit_code == 321,
+            std::string(kind) + " graphics specialization failure did not exit fatally");
+#else
+    ExpectFatal(name, [&] { RunGraphicsSpecializationDeathCase(vulkan, kind); });
+#endif
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // With a shader store a restart compiles nothing and creates every pipeline before the first
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
@@ -59985,6 +60078,11 @@ int main(int argc, char **argv) {
       std::strcmp(argv[1], "--storage-texture-descriptor-death") == 0) {
     RunStorageTextureDescriptorDeathCase(argv[2]);
   }
+  if (argc == 3 &&
+      std::strcmp(argv[1], "--graphics-specialization-death") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsSpecializationDeathCase(vulkan, argv[2]);
+  }
   if (argc != 1) {
     std::fprintf(stderr, "unknown test selector: %s\n", argv[1]);
     return 2;
@@ -60122,6 +60220,7 @@ int main(int argc, char **argv) {
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
   CheckComputeQueueModules(vulkan);
+  CheckGraphicsSpecializationFatal(vulkan);
   CheckGraphicsPushDataModules(vulkan);
   CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
