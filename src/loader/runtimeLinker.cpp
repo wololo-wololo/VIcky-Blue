@@ -19,6 +19,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/waitDebug.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -1669,6 +1670,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
 	const bool patch_guest_instructions =
 	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
+	if (Libs::LibKernel::WaitDebug::GuestTimeScale() > 1) {
+		std::fprintf(stderr, "guest time scale: %llu (guest TSC %s, wait timeout scale %llu)\n",
+		             static_cast<unsigned long long>(Libs::LibKernel::WaitDebug::GuestTimeScale()),
+		             tsc_multiplier != 0 ? "patched" : "NOT patched: run with --guest-tsc",
+		             static_cast<unsigned long long>(Libs::LibKernel::WaitDebug::Scale()));
+	}
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {

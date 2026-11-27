@@ -173,13 +173,14 @@ static constexpr uint64_t GUEST_TSC_FREQUENCY = 1600000000;
 
 uint64_t KernelGuestTscMultiplier() {
 	static const uint64_t multiplier =
-	    ((GUEST_TSC_FREQUENCY << 32u) + KernelHostTscFrequency() / 2) / KernelHostTscFrequency();
+	    ((GUEST_TSC_FREQUENCY << 32u) + KernelHostTscFrequency() / 2) / KernelHostTscFrequency() /
+	    WaitDebug::GuestTimeScale();
 	return multiplier;
 }
 
 static uint64_t KernelReadTscNative() {
 	if (!Config::GuestTscEnabled()) {
-		return KernelHostTsc();
+		return KernelHostTsc() / WaitDebug::GuestTimeScale();
 	}
 	return static_cast<uint64_t>(
 	    (static_cast<unsigned __int128>(KernelHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
@@ -285,7 +286,7 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
 		case KERNEL_CLOCK_EXT_AD_NETWORK:
 		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
-			const auto ns = Common::SteadyNs();
+			const auto ns = Common::SteadyNs() / WaitDebug::GuestTimeScale();
 			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
 			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
 			return true;
@@ -512,6 +513,7 @@ static void SchedulerBackoffOnce() {
 
 // A guest signal queued as a special user APC runs only when the sleep returns.
 static void SleepNanoInSlices(uint64_t nanoseconds) {
+	nanoseconds *= WaitDebug::GuestTimeScale();
 	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
 	const auto         start       = Common::SteadyNs();
 	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {

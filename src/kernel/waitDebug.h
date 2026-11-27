@@ -23,10 +23,23 @@ inline const char* KindName(int kind) {
 	return names[kind];
 }
 
+// KYTY_GUEST_TIME_SCALE=<n>: guest time runs n times slower than host time. The guest TSC
+// (patched RDTSC with --guest-tsc, sceKernelReadTsc), process time and the monotonic clocks are
+// divided by n; sleeps and, unless KYTY_TIMEOUT_SCALE says otherwise, wait timeouts are
+// multiplied by n.
+inline uint64_t GuestTimeScale() {
+	static const uint64_t scale = [] {
+		const char* value = std::getenv("KYTY_GUEST_TIME_SCALE");
+		const long long n = value != nullptr ? std::atoll(value) : 1;
+		return static_cast<uint64_t>(std::max(1LL, n));
+	}();
+	return scale;
+}
+
 inline uint64_t Scale() {
 	static const uint64_t scale = [] {
 		const char* value = std::getenv("KYTY_TIMEOUT_SCALE");
-		const long long n = value != nullptr ? std::atoll(value) : 1;
+		const long long n = value != nullptr ? std::atoll(value) : static_cast<long long>(GuestTimeScale());
 		return static_cast<uint64_t>(std::max(1LL, n));
 	}();
 	return scale;
