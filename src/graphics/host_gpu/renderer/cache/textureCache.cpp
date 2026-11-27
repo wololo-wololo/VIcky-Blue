@@ -262,7 +262,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
-			FreeImage(association);
+			FreeImage(association, "stencil-association");
 		}
 	}
 	m_download_images.erase(id);
@@ -281,7 +281,35 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
+void TextureCache::FreeImage(ImageId id, const char* reason) {
+	static const bool heap_stats = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	if (const auto& image = m_slot_images[id];
+	    heap_stats && image.registered && image.heap_refs.load(std::memory_order_relaxed) != 0u) {
+		const auto describe = [](const ImageInfo& info) {
+			char text[192];
+			std::snprintf(text, sizeof(text),
+			              "0x%" PRIx64 "+0x%" PRIx64 " fmt=%u/%u type=%u %ux%ux%u lv=%u ly=%u tile=%u",
+			              info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
+			              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+			              info.extent.width, info.extent.height, info.extent.depth,
+			              static_cast<uint32_t>(info.resources.levels),
+			              static_cast<uint32_t>(info.resources.layers),
+			              static_cast<uint32_t>(info.tile_mode));
+			return std::string(text);
+		};
+		std::string key = std::string(reason) + " refs=" +
+		                  std::to_string(image.heap_refs.load(std::memory_order_relaxed)) + " freed " +
+		                  describe(image.info);
+		if (m_find_desc != nullptr) {
+			key += " | for ";
+			key += m_find_desc->heap ? "heap " : "";
+			key += "binding=" + std::to_string(static_cast<uint32_t>(m_find_desc->type)) + " " +
+			       describe(m_find_desc->info);
+		} else {
+			key += " | outside FindImage";
+		}
+		++m_heap_frees[key];
+	}
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
 }
@@ -726,7 +754,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			metadata->second.owner = replacement_id;
 		}
 	}
-	FreeImage(cached_id);
+	FreeImage(cached_id, "depth-replace");
 	return replacement_id;
 }
 
@@ -773,7 +801,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-	cache.FreeImage(cached_id);
+	cache.FreeImage(cached_id, "bc-alias");
 }
 
 } // namespace BcAlias
@@ -822,7 +850,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                                 requested.mip_layout.begin() + shared_levels,
 		                                 cached.info.mip_layout.begin()))) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				FreeImage(cached_id, "overlap-layout");
 			}
 			return {merged_id};
 		}
@@ -903,11 +931,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(view.mip),
 		             static_cast<uint32_t>(view.layer));
-		FreeImage(cached_id);
+		FreeImage(cached_id, "overlap-merge-mip");
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+		FreeImage(cached_id, "overlap-address");
 	}
 	return {merged_id};
 }
@@ -926,7 +954,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeImage(source_id, "expand");
 	return expanded_id;
 }
 
@@ -1313,6 +1341,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		m_find_desc = &desc;
+		struct ClearFindDesc {
+			const ImageDesc*& slot;
+			~ClearFindDesc() { slot = nullptr; }
+		} clear_find_desc {m_find_desc};
 		Common::SmallVector<ImageId, 8> candidates;
 		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
 		                     [&](ImageId id, Image&) { candidates.push_back(id); });
@@ -1393,7 +1426,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
+				FreeImage(result, "find-fewer-resources");
 				result = {};
 			}
 		}
@@ -2119,13 +2152,29 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, "unmap");
 	}
 }
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	if (!m_heap_frees.empty() && tick % 64u == 0u) {
+		// KYTY_HEAP_STATS: frees of heap-selected images in the last 64 frames, most frequent first.
+		std::vector<std::pair<uint64_t, const std::string*>> top;
+		uint64_t                                             total = 0;
+		for (const auto& [key, count]: m_heap_frees) {
+			top.emplace_back(count, &key);
+			total += count;
+		}
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::fprintf(stderr, "heap frees: %" PRIu64 " frees of heap-selected images in 64 frames, %zu kinds\n",
+		             total, top.size());
+		for (size_t i = 0; i < top.size() && i < 8u; i++) {
+			std::fprintf(stderr, "heap frees:   x%" PRIu64 " %s\n", top[i].first, top[i].second->c_str());
+		}
+		m_heap_frees.clear();
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -2167,7 +2216,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			--deletions;
-			FreeImage(id);
+			FreeImage(id, "gc");
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;

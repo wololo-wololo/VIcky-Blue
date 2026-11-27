@@ -18,6 +18,7 @@
 #include <bitset>
 #include <map>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
@@ -214,7 +215,8 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	// The reason names the call site for the KYTY_HEAP_STATS report of heap-selected frees.
+	void                      FreeImage(ImageId id, const char* reason = "other");
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -276,6 +278,10 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Debug aid (KYTY_HEAP_STATS): frees of images that resident heap elements still select,
+	// counted per call site, freed image and requesting descriptor; reported by the collector.
+	const ImageDesc*                                  m_find_desc = nullptr; // During FindImage.
+	std::map<std::string, uint64_t>                   m_heap_frees;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
