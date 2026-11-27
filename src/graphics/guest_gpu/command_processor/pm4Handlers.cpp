@@ -571,6 +571,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	cp.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -601,6 +602,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
+	cp.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {

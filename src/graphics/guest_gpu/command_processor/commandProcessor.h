@@ -111,6 +111,8 @@ public:
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
 	                    const volatile void* address);
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
+	// Experiment (KYTY_SYNC_GPU_WRITES=2): publish device-address writes before a condition read.
+	void PublishGpuWritesBeforeRead();
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);

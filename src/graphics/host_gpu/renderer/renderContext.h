@@ -67,6 +67,9 @@ public:
 	// through device addresses to the buffer cache now, and waits for the GPU, so the guest's next
 	// read of them downloads the written bytes.
 	void               PublishGpuWrites();
+	// Same, with KYTY_SYNC_GPU_WRITES=2 only: also before the command processor reads a condition
+	// from guest memory (COND_EXEC, branch, predication, WAIT_REG_MEM) and before draws.
+	void               PublishGpuWritesBeforeRead();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

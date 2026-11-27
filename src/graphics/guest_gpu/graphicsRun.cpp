@@ -262,6 +262,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
+	m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -702,6 +703,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
@@ -723,6 +725,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -735,7 +738,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 // Submits the recorded work every N draws so the host GPU starts before a long buffer ends.
+void CommandProcessor::PublishGpuWritesBeforeRead() {
+	m_renderer.PublishGpuWritesBeforeRead();
+}
+
 void CommandProcessor::CountDraw() {
+	m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (m_flush_draws == 0) {
 		return;
 	}

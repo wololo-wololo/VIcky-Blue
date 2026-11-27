@@ -6,6 +6,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 
@@ -174,6 +175,24 @@ void RenderContext::PublishGpuWrites() {
 	m_buffer_cache.ProcessFaultBuffer();
 	// The written pages are marked by a deferred operation that runs once the GPU has scanned
 	// the fault bitmap.
+	m_command_scheduler.Finish();
+}
+
+void RenderContext::PublishGpuWritesBeforeRead() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_GPU_WRITES");
+		return value != nullptr && std::atoi(value) >= 2;
+	}();
+	if (!enabled || !m_fault_process_pending) {
+		return;
+	}
+	static uint64_t count = 0;
+	if (++count % 10000u == 1u) {
+		std::fprintf(stderr, "sync gpu writes: %llu publishes before reads\n",
+		             static_cast<unsigned long long>(count));
+	}
+	m_fault_process_pending = false;
+	m_buffer_cache.ProcessFaultBuffer();
 	m_command_scheduler.Finish();
 }
 
