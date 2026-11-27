@@ -10,13 +10,16 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <vector>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <unordered_map>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -148,6 +151,39 @@ struct BufferReadLog {
 		             static_cast<unsigned long long>(other_reads), sites.size(), text);
 		gpu_reads = other_reads = 0;
 		sites.clear();
+	}
+
+	// KYTY_BUFFER_READ_LOG=data: also one line per read of GPU data from the main program or libc
+	// (instruction 0x900000000-0x920000000) with a summary of the 4 KiB page after its download:
+	// hash, set bits and non-zero dwords.
+	bool data = [] {
+		const char* value = std::getenv("KYTY_BUFFER_READ_LOG");
+		return value != nullptr && std::strcmp(value, "data") == 0;
+	}();
+
+	void Contents(uint64_t vaddr, uint64_t rip) const {
+		if (!data || rip < 0x900000000ull || rip >= 0x920000000ull) {
+			return;
+		}
+		const auto page = vaddr & ~0xfffull;
+		uint64_t   words[512];
+		if (!LibKernel::Memory::TryReadBacking(page, words, sizeof(words))) {
+			return;
+		}
+		uint64_t bits = 0, nonzero = 0;
+		for (const auto word: words) {
+			bits += static_cast<uint64_t>(std::popcount(word));
+			nonzero += static_cast<uint64_t>((word & 0xffffffffull) != 0) +
+			           static_cast<uint64_t>((word >> 32u) != 0);
+		}
+		std::fprintf(stderr,
+		             "buffer read data: frame %llu at 0x%llx page 0x%llx +%llx hash %016llx bits %llu "
+		             "nonzero-dw %llu\n",
+		             static_cast<unsigned long long>(DrawDumpFrameIndex()),
+		             static_cast<unsigned long long>(rip), static_cast<unsigned long long>(page),
+		             static_cast<unsigned long long>(vaddr - page),
+		             static_cast<unsigned long long>(XXH3_64bits(words, sizeof(words))),
+		             static_cast<unsigned long long>(bits), static_cast<unsigned long long>(nonzero));
 	}
 
 	void Note(uint64_t vaddr, uint64_t rip, bool gpu_data) {
@@ -543,11 +579,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, ui
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		const bool gpu_data = g_buffer_read_log.enabled &&
+		                      m_buffer_cache.IsRegionGpuModified(fault_vaddr, fault_size);
 		if (g_buffer_read_log.enabled) {
-			g_buffer_read_log.Note(fault_vaddr, fault_rip,
-			                       m_buffer_cache.IsRegionGpuModified(fault_vaddr, fault_size));
+			g_buffer_read_log.Note(fault_vaddr, fault_rip, gpu_data);
 		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		if (gpu_data) {
+			g_buffer_read_log.Contents(fault_vaddr, fault_rip);
+		}
 	}
 	return true;
 }
