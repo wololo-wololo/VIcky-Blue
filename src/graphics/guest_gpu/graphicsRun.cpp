@@ -88,10 +88,12 @@ struct IbCheck {
 	bool                                   enabled = std::getenv("KYTY_IB_CHECK") != nullptr;
 	std::vector<Entry>                     entries;
 	uint64_t                               frames = 0, buffers = 0, dwords = 0, gpu_at_read = 0,
-	         gpu_after_read = 0, changed = 0, changed_dwords = 0;
+	         gpu_after_read = 0, changed = 0, changed_dwords = 0, gpu_stale = 0, gpu_stale_dwords = 0,
+	         gpu_same = 0;
 	std::unordered_map<uint64_t, uint64_t> gpu_addresses;
 	std::unordered_map<uint64_t, uint64_t> changed_addresses;
 	int64_t                                last_report_ns = 0;
+	uint32_t                               gpu_stale_reported = 0;
 
 	void Read(BufferCache& buffers_cache, const uint32_t* commands, uint32_t num_dw) {
 		const auto address = reinterpret_cast<uint64_t>(commands);
@@ -129,12 +131,32 @@ struct IbCheck {
 			if (entry.gpu_at_read) {
 				gpu_addresses[entry.address]++;
 			}
-			if (buffers_cache.IsRegionGpuModified(entry.address, size)) {
+			const bool gpu_after = buffers_cache.IsRegionGpuModified(entry.address, size);
+			if (gpu_after) {
 				gpu_after_read++;
 				gpu_addresses[entry.address]++;
+			}
+			// The GPU is idle here: reading a GPU-modified page downloads its final contents.
+			const bool differs =
+			    XXH3_64bits(reinterpret_cast<const void*>(entry.address), size) != entry.hash;
+			if (entry.gpu_at_read || gpu_after) {
+				// Page-granular marks: the GPU may have written only beside the commands.
+				if (differs) {
+					gpu_stale++;
+					gpu_stale_dwords += entry.num_dw;
+					if (gpu_stale_reported++ < 24u) {
+						std::fprintf(stderr,
+						             "ib check: GPU-flagged buffer 0x%llx (%u dw, GPU data at read "
+						             "%d, written after %d) differs after the GPU ran\n",
+						             static_cast<unsigned long long>(entry.address), entry.num_dw,
+						             entry.gpu_at_read ? 1 : 0, gpu_after ? 1 : 0);
+					}
+				} else {
+					gpu_same++;
+				}
 				continue;
 			}
-			if (XXH3_64bits(reinterpret_cast<const void*>(entry.address), size) != entry.hash) {
+			if (differs) {
 				changed++;
 				changed_dwords += entry.num_dw;
 				changed_addresses[entry.address]++;
@@ -150,11 +172,15 @@ struct IbCheck {
 		last_report_ns = now;
 		std::fprintf(stderr,
 		             "ib check: %llu frames, %llu indirect buffers (%llu dw); GPU data at read %llu, "
-		             "GPU-written after read %llu; changed by the flip %llu (%llu dw)\n",
+		             "GPU-written after read %llu; GPU-flagged unchanged %llu, differing %llu (%llu dw); "
+		             "other changed by the flip %llu (%llu dw)\n",
 		             static_cast<unsigned long long>(frames), static_cast<unsigned long long>(buffers),
 		             static_cast<unsigned long long>(dwords),
 		             static_cast<unsigned long long>(gpu_at_read),
 		             static_cast<unsigned long long>(gpu_after_read),
+		             static_cast<unsigned long long>(gpu_same),
+		             static_cast<unsigned long long>(gpu_stale),
+		             static_cast<unsigned long long>(gpu_stale_dwords),
 		             static_cast<unsigned long long>(changed),
 		             static_cast<unsigned long long>(changed_dwords));
 		if (!gpu_addresses.empty()) {
@@ -164,6 +190,7 @@ struct IbCheck {
 			Top("changed buffers", changed_addresses);
 		}
 		frames = buffers = dwords = gpu_at_read = gpu_after_read = changed = changed_dwords = 0;
+		gpu_stale = gpu_stale_dwords = gpu_same = 0;
 	}
 } g_ib_check;
 
