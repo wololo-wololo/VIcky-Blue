@@ -760,6 +760,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 
 namespace BcAlias {
 
+// BC blocks are 8 or 16 bytes, and a raw alias has texels of the same size.
+static bool MayAlias(const ImageInfo& info) {
+	return info.samples == 1 && (info.bytes_per_block == 8 || info.bytes_per_block == 16);
+}
+
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
 	return requested.guest_format != cached.guest_format &&
 	       requested.IsBlock() != cached.IsBlock() &&
@@ -822,7 +827,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
 	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
-		BcAlias::Resolve(*this, cached_id, merged_id);
+		// PS5: image heaps also select a BC image and a raw block image of one of its mips at
+		// once, at different addresses. Retiring the selected one makes its element stale; its
+		// lookup then retires this image, and so on at every draw. A read that finds a selected
+		// alias holding no GPU write keeps it: both upload from guest memory, and a GPU write to
+		// either reaches the other through PublishBcAliasWrites.
+		const bool keep = binding == BindingType::Texture &&
+		                  cached.heap_refs.load(std::memory_order_relaxed) != 0u &&
+		                  !cached.IsGpuModified() &&
+		                  (!merged_id || !m_slot_images[merged_id].IsGpuModified());
+		if (!keep) {
+			BcAlias::Resolve(*this, cached_id, merged_id);
+		}
 		return {merged_id};
 	}
 	const bool safe_to_delete = m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
@@ -1622,9 +1638,72 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
+	// The first write since the image last matched its guest bytes. A later write leaves the
+	// image GPU-current, so a pending entry still covers it.
+	const bool first_write = !image.SafeToDownload();
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+	if (first_write && !image.depth_id && image.registered && HasHeapBcAlias(image)) {
+		m_bc_alias_writes.push_back(image.info.data);
+	}
+}
+
+bool TextureCache::IsCleanBcAlias(const Image& alias, const Image& image) {
+	return &alias != &image && alias.registered && !alias.depth_id && !alias.IsGpuModified() &&
+	       alias.info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       BcAlias::Matches(alias.info, image.info);
+}
+
+bool TextureCache::HasHeapBcAlias(const Image& image) {
+	if (!BcAlias::MayAlias(image.info)) {
+		return false;
+	}
+	bool found = false;
+	ForEachImageInRegion(image.info.data.address, image.info.data.size, [&](ImageId, Image& alias) {
+		found = alias.heap_refs.load(std::memory_order_relaxed) != 0u && IsCleanBcAlias(alias, image);
+		return found;
+	});
+	return found;
+}
+
+void TextureCache::PublishBcAliasWrites() {
+	std::scoped_lock lock {m_lock};
+	if (m_bc_alias_writes.empty()) {
+		return;
+	}
+	const auto writes = std::exchange(m_bc_alias_writes, {});
+	for (const auto& range: writes) {
+		Common::SmallVector<ImageId, 8> written;
+		ForEachImageInRegion(range.address, range.size, [&](ImageId id, Image& image) {
+			if (!image.depth_id && image.SafeToDownload() && BcAlias::MayAlias(image.info)) {
+				written.push_back(id);
+			}
+		});
+		for (const auto id: written) {
+			auto& image = m_slot_images[id];
+			if (!image.registered || !image.SafeToDownload()) {
+				continue;
+			}
+			Common::SmallVector<ImageId, 8> aliases;
+			ForEachImageInRegion(image.info.data.address, image.info.data.size,
+			                     [&](ImageId alias_id, Image& alias) {
+				                     if (IsCleanBcAlias(alias, image)) {
+					                     aliases.push_back(alias_id);
+				                     }
+			                     });
+			// An image that cannot be downloaded leaves its aliases with their guest bytes, as
+			// BcAlias::Resolve leaves the image it was asked for.
+			if (aliases.empty() || !BcAlias::Publish(*this, image)) {
+				continue;
+			}
+			// Each alias, heap-selected or not, uploads the published bytes at its next refresh: an
+			// image heap refreshes it at this discovery, a binding when it acquires the texture.
+			for (const auto alias_id: aliases) {
+				m_slot_images[alias_id].MarkBufferModified();
+			}
+		}
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

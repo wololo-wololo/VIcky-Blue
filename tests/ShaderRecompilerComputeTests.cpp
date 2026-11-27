@@ -9499,6 +9499,94 @@ public:
         if (viewed) (void)texture_cache.FindTexture(raw_image, raw);
       }
 
+      // Image heaps also select a BC texture and a raw block image of one of its mips at once,
+      // at different addresses. Neither heap lookup retires the other (each retirement made the
+      // other element stale, and its lookup retired the first again), and a GPU write to the raw
+      // image still reaches the BC texture.
+      {
+        const uint64_t address = base + 0x2000000;
+        constexpr uint32_t level = 1, levels = 7;
+        auto bc = MakeLinearDesc(address, 0, vk::Format::eBc4UnormBlock,
+            Prospero::BufferFormat::kBc4UNorm, Prospero::ImageType::kColor2D,
+            {256, 512, 1}, 1, 8, 1);
+        bc.info.resources.levels = levels;
+        bc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        bc.info.UpdateSize();
+        bc.view_info.level_count = levels;
+        bc.heap = true;
+        const auto mip = bc.info.mip_layout[level];
+        Require(name, "heap BC alias layout",
+                mip.offset != 0 && level < bc.info.first_tail_level &&
+                    mip.offset + mip.size <= bc.info.data.size,
+                "the raw mip under test starts at the BC address or lies in the mip tail");
+        std::memset(memory + (address - base), 0xff, bc.info.data.size);
+        auto raw = MakeLinearDesc(address + mip.offset, 0, vk::Format::eR32G32Uint,
+            Prospero::BufferFormat::k32_32UInt, Prospero::ImageType::kColor2D,
+            {mip.pitch, mip.height, 1}, 1, 8, 1);
+        raw.info.tile_mode = bc.info.tile_mode;
+        raw.info.UpdateSize();
+        raw.heap = true;
+
+        auto bc_lookup = bc;
+        const auto bc_image = texture_cache.FindImage(bc_lookup);
+        (void)texture_cache.FindTexture(bc_image, bc_lookup);
+        texture_cache.GetImage(bc_image).heap_refs.fetch_add(1u);
+        auto raw_lookup = raw;
+        const auto raw_image = texture_cache.FindImage(raw_lookup);
+        Require(name, "heap-selected BC alias kept",
+                raw_image && raw_image != bc_image &&
+                    TextureCacheTestAccess::Contains(texture_cache, bc_image),
+                "a raw heap lookup retired the heap-selected BC image");
+        (void)texture_cache.FindTexture(raw_image, raw_lookup);
+        texture_cache.GetImage(raw_image).heap_refs.fetch_add(1u);
+        for (uint32_t round = 0; round < 2; ++round) {
+          auto bc_again = bc;
+          auto raw_again = raw;
+          Require(name, "heap-selected BC aliases coexist",
+                  texture_cache.FindImage(bc_again) == bc_image &&
+                      texture_cache.FindImage(raw_again) == raw_image &&
+                      TextureCacheTestAccess::Contains(texture_cache, bc_image) &&
+                      TextureCacheTestAccess::Contains(texture_cache, raw_image),
+                  "heap lookups of a BC image and its raw mip retired each other");
+        }
+
+        constexpr uint32_t written = 0x2468ace0u;
+        vk::ClearValue clear{};
+        std::fill_n(clear.color.uint32.data(), 4, written);
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), raw_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        texture_cache.PublishBcAliasWrites();
+        Require(name, "raw write publishes to its BC alias",
+                TextureCacheTestAccess::Contains(texture_cache, bc_image) &&
+                    TextureCacheTestAccess::Contains(texture_cache, raw_image) &&
+                    !texture_cache.GetImage(raw_image).IsGpuModified() &&
+                    texture_cache.GetImage(bc_image).IsBufferModified(),
+                "a GPU write to the raw mip was not published to the heap-selected BC image");
+        (void)texture_cache.FindTexture(bc_image, bc_lookup);
+        std::vector<vk::BufferImageCopy> probes(2);
+        for (uint32_t probe = 0; probe < probes.size(); ++probe) {
+          probes[probe].bufferOffset = probe * 2 * sizeof(uint32_t);
+          probes[probe].imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                            probe == 0 ? 0u : level, 0, 1};
+          probes[probe].imageExtent = {4, 4, 1};
+        }
+        const std::vector<uint32_t> expected{UINT32_MAX, UINT32_MAX, written, written};
+        auto readback = CreateHostBuffer(name, expected.size() * sizeof(uint32_t),
+            vk::BufferUsageFlagBits::eTransferDst, std::vector<uint32_t>(expected.size()));
+        texture_cache.GetImage(bc_image).Download(probes, readback.buffer, 0, readback.size);
+        HostReadBarrier(readback.buffer, readback.size, vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "heap BC alias contents",
+                ReadBuffer(name, readback, expected.size()) == expected,
+                "the BC image lost the raw mip's GPU write or its other mips' guest bytes");
+        DestroyBuffer(&readback);
+        texture_cache.GetImage(bc_image).heap_refs.store(0u);
+        texture_cache.GetImage(raw_image).heap_refs.store(0u);
+        TextureCacheTestAccess::DeleteImage(texture_cache, raw_image);
+        TextureCacheTestAccess::DeleteImage(texture_cache, bc_image);
+      }
+
       // A write through a separate buffer must not replace untouched image
       // texels with stale backing bytes. Exact-base writes still refresh it.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;

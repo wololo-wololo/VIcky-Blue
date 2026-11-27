@@ -622,6 +622,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	auto& stats = g_rebind_stats;
 	stats.Start();
 	auto& textures = m_context.GetTextureCache();
+	// Earlier draws are recorded, so their writes to images with selected BC aliases publish now
+	// and the aliases' changes are taken below.
+	textures.PublishBcAliasWrites();
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {

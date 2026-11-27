@@ -72,6 +72,11 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// PS5: a BC image and a raw block image inside its memory can both stay resident while image
+	// heaps select one of them. Downloads each image written since its first GPU write was
+	// noted, and makes its clean BC aliases upload the result. Run before discovery takes image
+	// heap changes, once the commands of those writes are recorded.
+	void PublishBcAliasWrites();
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -245,6 +250,11 @@ private:
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	// Whether alias is a registered BC alias of image that holds no GPU write of its own and can
+	// upload guest bytes.
+	[[nodiscard]] static bool IsCleanBcAlias(const Image& alias, const Image& image);
+	// Whether an image heap selects a clean BC alias of image. Caller holds m_lock.
+	[[nodiscard]] bool HasHeapBcAlias(const Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
@@ -282,6 +292,8 @@ private:
 	// counted per call site, freed image and requesting descriptor; reported by the collector.
 	const ImageDesc*                                  m_find_desc = nullptr; // During FindImage.
 	std::map<std::string, uint64_t>                   m_heap_frees;
+	// Ranges of images whose first GPU write left a heap-selected clean BC alias behind.
+	std::vector<GuestRange>                           m_bc_alias_writes;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
