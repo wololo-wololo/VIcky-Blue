@@ -30,6 +30,14 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// Debug aid (issue 22), KYTY_DRAW_DUMP=<dir>: per guest frame, a line per draw with what it
+// consumes (see renderDraw.cpp). DrawDumpFlip ends the guest frame and returns its index;
+// DrawDumpPresent records the index of the frame being presented, shown in the window title.
+bool     DrawDumpEnabled();
+uint64_t DrawDumpFlip(CommandScheduler& scheduler);
+void     DrawDumpPresent(uint64_t frame);
+uint64_t DrawDumpPresentedFrame();
+
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
 	IndirectArgs,
