@@ -1725,10 +1725,60 @@ static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
 	return 0x1fff;
 }
 
+// Experiment (issue 22), KYTY_CURRENT_CPU. Unset: every thread is told it runs on core 0, as
+// before. "zero": the same answer, but the calls are logged. "thread": each guest thread gets the
+// single core its affinity mask allows, or else a stable per-thread number below 13 (the cores of
+// the available mask 0x1fff), so per-core data a game indexes with it is no longer shared.
+// Logged: each thread's first call, and the call count every 2 s.
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 	PRINT_NAME();
 
-	return 0;
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_CURRENT_CPU");
+		if (value == nullptr || *value == '\0') {
+			return 0;
+		}
+		return std::strcmp(value, "thread") == 0 ? 2 : 1;
+	}();
+	if (mode == 0) {
+		return 0;
+	}
+	static std::atomic<int>      next_cpu {0};
+	static std::atomic<uint64_t> calls {0};
+	static std::atomic<int64_t>  last_report_ns {0};
+	thread_local int             cpu = -1;
+	if (cpu < 0) {
+		KernelCpumask mask = 0;
+		auto*         self = PthreadSelfOrNull();
+		if (self != nullptr && PthreadGetaffinity(self, &mask) != 0) {
+			mask = 0;
+		}
+		const KernelCpumask cores = mask & 0x1fffu;
+		int                 value = 0;
+		if (mode == 2) {
+			value = std::popcount(cores) == 1 ? std::countr_zero(cores)
+			                                  : next_cpu.fetch_add(1) % 13;
+		}
+		char name[64] = "(host thread)";
+		if (self != nullptr && PthreadGetname(self, name) != 0) {
+			std::snprintf(name, sizeof(name), "(unnamed)");
+		}
+		std::fprintf(stderr, "current cpu: thread '%s' affinity 0x%llx answered %d\n", name,
+		             static_cast<unsigned long long>(mask), value);
+		cpu = value;
+	}
+	calls.fetch_add(1, std::memory_order_relaxed);
+	const auto now  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+	auto       last = last_report_ns.load(std::memory_order_relaxed);
+	if (last == 0) {
+		last_report_ns.compare_exchange_strong(last, now);
+	} else if (now - last >= 2000000000LL && last_report_ns.compare_exchange_strong(last, now)) {
+		std::fprintf(stderr, "current cpu: %llu calls in the last 2 s\n",
+		             static_cast<unsigned long long>(calls.exchange(0)));
+	}
+	return cpu;
 }
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
