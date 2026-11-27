@@ -38,6 +38,8 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(const uint64_t* label);
+	// Waits at most about `micros` for the flip; returns true once it is done.
+	bool WaitFlipDoneFor(const uint64_t* label, uint32_t micros);
 
 	[[nodiscard]] Impl& State() noexcept;
 
