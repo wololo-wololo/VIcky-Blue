@@ -1313,6 +1313,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
 	}
 	const auto dump_frame = DrawDumpFlip(GetScheduler());
+	m_renderer.WriteWatchFlip();
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
@@ -1332,6 +1333,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
 	}
 	const auto dump_frame = DrawDumpFlip(GetScheduler());
+	m_renderer.WriteWatchFlip();
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation([this, request_id, dump_frame] {

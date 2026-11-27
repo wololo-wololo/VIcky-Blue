@@ -874,10 +874,10 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
-                    uint64_t fault_rip) noexcept {
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr, uint64_t fault_rip,
+                    uint64_t fault_rsp) noexcept {
 	return g_gpu_resources != nullptr &&
-	       g_gpu_resources->HandleFault(access, fault_vaddr, fault_rip);
+	       g_gpu_resources->HandleFault(access, fault_vaddr, fault_rip, fault_rsp);
 }
 
 struct PrtAperture {

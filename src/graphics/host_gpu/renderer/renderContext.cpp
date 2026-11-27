@@ -169,6 +169,147 @@ struct BufferReadLog {
 	}
 } g_buffer_read_log;
 
+// Debug aid (issue 22), KYTY_WRITE_WATCH=<begin>-<end>[,...]: at every guest flip, each page of
+// the listed ranges is write-protected once. The first guest write to it faults, is recorded
+// with the writing instruction and the first code addresses found on the writer's stack (a
+// stand-in for its callers), and unprotects the page. KYTY_WRITE_WATCH_CODE=<begin>-<end> sets
+// the code range those stack values must fall in (default: the main program's usual range).
+struct WriteWatch {
+	struct Range {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	struct Chain {
+		uint64_t count = 0;
+		uint64_t page  = 0;
+		int      range = 0;
+	};
+	std::vector<Range>                           ranges = Parse(std::getenv("KYTY_WRITE_WATCH"));
+	Range                                        code   = [] {
+        const auto list = Parse(std::getenv("KYTY_WRITE_WATCH_CODE"));
+        return list.empty() ? Range {0x900000000ull, 0x910000000ull} : list.front();
+	}();
+	std::mutex                                   mutex;
+	std::vector<uint64_t>                        armed_pages;
+	std::unordered_map<uint64_t, bool>           armed;
+	std::map<std::vector<uint64_t>, Chain>       chains;
+	uint64_t                                     faults = 0, flips = 0;
+	int64_t                                      last_report_ns = 0;
+
+	static std::vector<Range> Parse(const char* text) {
+		std::vector<Range> list;
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto begin = std::strtoull(text, &end, 0);
+			if (end == text || *end != '-') {
+				break;
+			}
+			text           = end + 1;
+			const auto top = std::strtoull(text, &end, 0);
+			if (end == text) {
+				break;
+			}
+			list.push_back({begin & ~0xfffull, (top + 0xfffull) & ~0xfffull});
+			text = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}
+
+	[[nodiscard]] bool Enabled() const { return !ranges.empty(); }
+
+	template <typename IsMapped>
+	void Flip(PageManager& pages, IsMapped&& is_mapped) {
+		std::scoped_lock lock {mutex};
+		flips++;
+		for (const auto& range: ranges) {
+			for (auto page = range.begin; page < range.end; page += 0x1000) {
+				auto [it, inserted] = armed.try_emplace(page, true);
+				if (!inserted && it->second) {
+					continue;
+				}
+				if (!is_mapped(page)) {
+					armed.erase(it);
+					continue;
+				}
+				it->second = true;
+				pages.UpdatePageWatchers<true, false>(page, 0x1000);
+			}
+		}
+		Report();
+	}
+
+	bool Note(PageManager& pages, uint64_t vaddr, uint64_t rip, uint64_t rsp) {
+		const auto page = vaddr & ~0xfffull;
+		std::scoped_lock lock {mutex};
+		const auto it = armed.find(page);
+		if (it == armed.end() || !it->second) {
+			return false;
+		}
+		it->second = false;
+		pages.UpdatePageWatchers<false, false>(page, 0x1000);
+		faults++;
+		std::vector<uint64_t> key {rip};
+		if (rsp != 0) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(rsp);
+			for (int i = 0; i < 64 && key.size() < 5; i++) {
+				const auto value = stack[i];
+				if (value >= code.begin && value < code.end) {
+					key.push_back(value);
+				}
+			}
+		}
+		int range_index = 0;
+		for (size_t i = 0; i < ranges.size(); i++) {
+			if (page >= ranges[i].begin && page < ranges[i].end) {
+				range_index = static_cast<int>(i);
+			}
+		}
+		auto& chain = chains[key];
+		if (chain.count++ == 0) {
+			chain.page  = page;
+			chain.range = range_index;
+		}
+		return true;
+	}
+
+	void Report() {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns == 0) {
+			last_report_ns = now;
+			return;
+		}
+		if (now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr, "write watch: %llu flips, %llu first writes, %zu writer chains\n",
+		             static_cast<unsigned long long>(flips),
+		             static_cast<unsigned long long>(faults), chains.size());
+		std::vector<std::pair<std::vector<uint64_t>, Chain>> top(chains.begin(), chains.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+		for (size_t i = 0; i < top.size() && i < 16; i++) {
+			char   text[256] = {};
+			size_t used      = 0;
+			for (const auto value: top[i].first) {
+				const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx",
+				                            static_cast<unsigned long long>(value));
+				if (n < 0 || static_cast<size_t>(n) >= sizeof(text) - used) {
+					break;
+				}
+				used += static_cast<size_t>(n);
+			}
+			std::fprintf(stderr, "write watch:   range %d x%llu first page 0x%llx: at%s\n",
+			             top[i].second.range, static_cast<unsigned long long>(top[i].second.count),
+			             static_cast<unsigned long long>(top[i].second.page), text);
+		}
+		chains.clear();
+		faults = flips = 0;
+	}
+} g_write_watch;
+
 bool AliasLogNote(AliasUse use, uint64_t vaddr, uint64_t size) {
 	if (!LibKernel::Memory::AliasLogEnabled() || size == 0) {
 		return false;
@@ -361,13 +502,23 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
-                                uint64_t fault_rip) noexcept {
+void RenderContext::WriteWatchFlip() {
+	if (g_write_watch.Enabled()) {
+		g_write_watch.Flip(m_page_manager,
+		                   [this](uint64_t page) { return IsMapped(page, 0x1000); });
+	}
+}
+
+bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr, uint64_t fault_rip,
+                                uint64_t fault_rsp) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	if (access == PageFaultAccess::Write && g_write_watch.Enabled()) {
+		(void)g_write_watch.Note(m_page_manager, fault_vaddr, fault_rip, fault_rsp);
 	}
 	// The access retries once the image write-backs over its page land.
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
