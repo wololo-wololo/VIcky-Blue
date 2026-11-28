@@ -17,18 +17,25 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 
+#include <chrono>
+#include <cstdio>
+#include <map>
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <tuple>
 #include <utility>
+#include <unordered_map>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -115,6 +122,20 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	}
 	clear.float32 = channels;
 	return true;
+}
+
+// KYTY_HEAP_STATS reports: one image description per line entry.
+std::string DescribeImageInfo(const ImageInfo& info) {
+	char text[192];
+	std::snprintf(text, sizeof(text),
+	              "0x%" PRIx64 "+0x%" PRIx64 " fmt=%u/%u type=%u %ux%ux%u lv=%u ly=%u tile=%u",
+	              info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
+	              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.type),
+	              info.extent.width, info.extent.height, info.extent.depth,
+	              static_cast<uint32_t>(info.resources.levels),
+	              static_cast<uint32_t>(info.resources.layers),
+	              static_cast<uint32_t>(info.tile_mode));
+	return std::string(text);
 }
 
 } // namespace
@@ -262,7 +283,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
-			FreeImage(association);
+			FreeImage(association, "stencil-association");
 		}
 	}
 	m_download_images.erase(id);
@@ -281,7 +302,24 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
+void TextureCache::FreeImage(ImageId id, const char* reason) {
+	static const bool heap_stats = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	if (const auto& image = m_slot_images[id];
+	    heap_stats && image.registered && image.heap_refs.load(std::memory_order_relaxed) != 0u) {
+		const auto describe = DescribeImageInfo;
+		std::string key = std::string(reason) + " refs=" +
+		                  std::to_string(image.heap_refs.load(std::memory_order_relaxed)) + " freed " +
+		                  describe(image.info);
+		if (m_find_desc != nullptr) {
+			key += " | for ";
+			key += m_find_desc->heap ? "heap " : "";
+			key += "binding=" + std::to_string(static_cast<uint32_t>(m_find_desc->type)) + " " +
+			       describe(m_find_desc->info);
+		} else {
+			key += " | outside FindImage";
+		}
+		++m_heap_frees[key];
+	}
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
 }
@@ -556,6 +594,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
+		m_copy_path = source.info.data == destination.info.data ? "buffer-modified" : "skipped";
 		return;
 	}
 	const bool source_depth = source.info.IsDepth();
@@ -570,13 +609,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	      CanCopyAspectToColor(source_depth ? source.backing.format : destination.backing.format,
 	                           source_depth ? destination.backing.format : source.backing.format)));
 	if (direct_copy) {
+		m_copy_path = "direct";
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
+		m_copy_path = "buffer";
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
+	} else {
+		m_copy_path = "d16";
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
@@ -668,6 +711,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	static const bool heap_stats = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	// Read before RefreshImage, which may download or upload the cached image.
+	const bool cached_gpu_modified    = cached.IsGpuModified();
+	const bool cached_buffer_modified = cached.IsBufferModified();
+	const bool cached_cpu_dirty       = cached.IsDefinitelyCpuDirty();
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -691,10 +739,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.binding.needs_rebind = true;
 	}
 	// The copy below covers only the cached layers and levels; the rest start from guest memory.
-	if (info.resources.levels > cached.info.resources.levels ||
-	    info.resources.layers > cached.info.resources.layers) {
+	const bool initialized = info.resources.levels > cached.info.resources.levels ||
+	                         info.resources.layers > cached.info.resources.layers;
+	if (initialized) {
 		InitializeImage(replacement_id);
 	}
+	m_copy_path = "none";
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
@@ -726,11 +776,30 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			metadata->second.owner = replacement_id;
 		}
 	}
-	FreeImage(cached_id);
+	if (heap_stats) {
+		// KYTY_HEAP_STATS: every depth<->color replacement, keyed by what it lost or kept.
+		std::string key = "binding=" + std::to_string(static_cast<uint32_t>(binding)) +
+		                  (m_find_desc != nullptr && m_find_desc->heap ? " heap" : "") +
+		                  " cached{" + DescribeImageInfo(cached.info) +
+		                  (cached_gpu_modified ? " gpu" : "") +
+		                  (cached_buffer_modified ? " buf" : "") +
+		                  (cached_cpu_dirty ? " cpu" : "") + " refs=" +
+		                  std::to_string(cached.heap_refs.load(std::memory_order_relaxed)) +
+		                  "} -> new{" + DescribeImageInfo(info) + "} copy=" + m_copy_path +
+		                  (initialized ? " init-from-guest" : "") +
+		                  (replacement.IsGpuModified() ? " new-gpu" : "");
+		++m_depth_replaces[key];
+	}
+	FreeImage(cached_id, "depth-replace");
 	return replacement_id;
 }
 
 namespace BcAlias {
+
+// BC blocks are 8 or 16 bytes, and a raw alias has texels of the same size.
+static bool MayAlias(const ImageInfo& info) {
+	return info.samples == 1 && (info.bytes_per_block == 8 || info.bytes_per_block == 16);
+}
 
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
 	return requested.guest_format != cached.guest_format &&
@@ -773,7 +842,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-	cache.FreeImage(cached_id);
+	cache.FreeImage(cached_id, "bc-alias");
 }
 
 } // namespace BcAlias
@@ -794,7 +863,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
 	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
-		BcAlias::Resolve(*this, cached_id, merged_id);
+		// PS5: image heaps also select a BC image and a raw block image of one of its mips at
+		// once, at different addresses. Retiring the selected one makes its element stale; its
+		// lookup then retires this image, and so on at every draw. A read that finds a selected
+		// alias holding no GPU write keeps it: both upload from guest memory, and a GPU write to
+		// either reaches the other through PublishBcAliasWrites.
+		const bool keep = binding == BindingType::Texture &&
+		                  cached.heap_refs.load(std::memory_order_relaxed) != 0u &&
+		                  !cached.IsGpuModified() &&
+		                  (!merged_id || !m_slot_images[merged_id].IsGpuModified());
+		if (!keep) {
+			BcAlias::Resolve(*this, cached_id, merged_id);
+		}
 		return {merged_id};
 	}
 	const bool safe_to_delete = m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
@@ -822,7 +902,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                                 requested.mip_layout.begin() + shared_levels,
 		                                 cached.info.mip_layout.begin()))) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				FreeImage(cached_id, "overlap-layout");
 			}
 			return {merged_id};
 		}
@@ -903,11 +983,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(view.mip),
 		             static_cast<uint32_t>(view.layer));
-		FreeImage(cached_id);
+		FreeImage(cached_id, "overlap-merge-mip");
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+		FreeImage(cached_id, "overlap-address");
 	}
 	return {merged_id};
 }
@@ -926,7 +1006,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeImage(source_id, "expand");
 	return expanded_id;
 }
 
@@ -1204,8 +1284,27 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+// Debug aid (issue 22, KYTY_ALIAS_LOG): a sampled hash of an image's guest bytes (256 bytes every
+// 64 KiB or more, at most 4,096 samples), read from the backing without faulting.
+static uint64_t SampleGuestHash(const ImageInfo& info) {
+	std::array<uint8_t, 256> bytes {};
+	const auto               range = info.data;
+	const uint64_t           step  = std::max<uint64_t>(0x10000u, range.size / 4096u);
+	uint64_t                 hash  = 0;
+	for (uint64_t offset = 0; offset < range.size; offset += step) {
+		const auto size = std::min<uint64_t>(bytes.size(), range.size - offset);
+		if (!LibKernel::Memory::TryReadBacking(range.address + offset, bytes.data(), size)) {
+			return 0;
+		}
+		hash = XXH3_64bits_withSeed(bytes.data(), static_cast<size_t>(size), hash);
+	}
+	return hash;
+}
+
 void TextureCache::RefreshImage(ImageId id) {
-	auto& image = m_slot_images[id];
+	auto&      image = m_slot_images[id];
+	const bool aliased =
+	    AliasLogNote(AliasUse::ImageRefresh, image.info.data.address, image.info.data.size);
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
@@ -1216,6 +1315,21 @@ void TextureCache::RefreshImage(ImageId id) {
 		image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
+	// Experiment (issue 22): KYTY_ALIAS_LOG=2 also re-uploads aliased images whose guest bytes
+	// changed unseen.
+	if (aliased && !image.IsGpuModified() &&
+	    image.info.metadata.compression == VideoOutCompression::Uncompressed) {
+		static std::unordered_map<uint64_t, uint64_t> hashes;
+		static const int mode = std::atoi(std::getenv("KYTY_ALIAS_LOG"));
+		const auto       key  = image.info.data.address ^ (image.info.data.size << 40u);
+		const auto       hash = SampleGuestHash(image.info);
+		const auto [it, inserted] = hashes.try_emplace(key, hash);
+		if (!inserted && it->second != hash && !cpu_dirty) {
+			AliasLogNote(AliasUse::StaleImage, image.info.data.address, image.info.data.size);
+			cpu_dirty = cpu_dirty || mode >= 2;
+		}
+		it->second = hash;
+	}
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
 			EXIT("TextureCache: compressed guest image refresh is unsupported\n");
@@ -1313,6 +1427,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		m_find_desc = &desc;
+		struct ClearFindDesc {
+			const ImageDesc*& slot;
+			~ClearFindDesc() { slot = nullptr; }
+		} clear_find_desc {m_find_desc};
 		Common::SmallVector<ImageId, 8> candidates;
 		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
 		                     [&](ImageId id, Image&) { candidates.push_back(id); });
@@ -1393,7 +1512,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
+				FreeImage(result, "find-fewer-resources");
 				result = {};
 			}
 		}
@@ -1589,9 +1708,72 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
+	// The first write since the image last matched its guest bytes. A later write leaves the
+	// image GPU-current, so a pending entry still covers it.
+	const bool first_write = !image.SafeToDownload();
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+	if (first_write && !image.depth_id && image.registered && HasHeapBcAlias(image)) {
+		m_bc_alias_writes.push_back(image.info.data);
+	}
+}
+
+bool TextureCache::IsCleanBcAlias(const Image& alias, const Image& image) {
+	return &alias != &image && alias.registered && !alias.depth_id && !alias.IsGpuModified() &&
+	       alias.info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       BcAlias::Matches(alias.info, image.info);
+}
+
+bool TextureCache::HasHeapBcAlias(const Image& image) {
+	if (!BcAlias::MayAlias(image.info)) {
+		return false;
+	}
+	bool found = false;
+	ForEachImageInRegion(image.info.data.address, image.info.data.size, [&](ImageId, Image& alias) {
+		found = alias.heap_refs.load(std::memory_order_relaxed) != 0u && IsCleanBcAlias(alias, image);
+		return found;
+	});
+	return found;
+}
+
+void TextureCache::PublishBcAliasWrites() {
+	std::scoped_lock lock {m_lock};
+	if (m_bc_alias_writes.empty()) {
+		return;
+	}
+	const auto writes = std::exchange(m_bc_alias_writes, {});
+	for (const auto& range: writes) {
+		Common::SmallVector<ImageId, 8> written;
+		ForEachImageInRegion(range.address, range.size, [&](ImageId id, Image& image) {
+			if (!image.depth_id && image.SafeToDownload() && BcAlias::MayAlias(image.info)) {
+				written.push_back(id);
+			}
+		});
+		for (const auto id: written) {
+			auto& image = m_slot_images[id];
+			if (!image.registered || !image.SafeToDownload()) {
+				continue;
+			}
+			Common::SmallVector<ImageId, 8> aliases;
+			ForEachImageInRegion(image.info.data.address, image.info.data.size,
+			                     [&](ImageId alias_id, Image& alias) {
+				                     if (IsCleanBcAlias(alias, image)) {
+					                     aliases.push_back(alias_id);
+				                     }
+			                     });
+			// An image that cannot be downloaded leaves its aliases with their guest bytes, as
+			// BcAlias::Resolve leaves the image it was asked for.
+			if (aliases.size() == 0 || !BcAlias::Publish(*this, image)) {
+				continue;
+			}
+			// Each alias, heap-selected or not, uploads the published bytes at its next refresh: an
+			// image heap refreshes it at this discovery, a binding when it acquires the texture.
+			for (const auto alias_id: aliases) {
+				m_slot_images[alias_id].MarkBufferModified();
+			}
+		}
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1888,6 +2070,193 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+namespace {
+
+// Debug aid (issue 22), KYTY_IMAGE_VALUE_LOG=<address>|vk<format>,...: for the listed image
+// addresses, and images up to 4 KiB in the listed Vulkan formats, the
+// contents of every copy-back (non-zero dwords by byte offset, tagged with the draw dump frame
+// index at which the copy-back was recorded) and, with KYTY_IMAGE_READ_WATCH, each first guest
+// access after it.
+struct ValueLog {
+	std::vector<uint64_t> addresses;
+	std::vector<int>      formats;
+
+	ValueLog() {
+		const char* p = std::getenv("KYTY_IMAGE_VALUE_LOG");
+		while (p != nullptr && *p != '\0') {
+			const bool format = p[0] == 'v' && p[1] == 'k';
+			const char* start = format ? p + 2 : p;
+			char*       end   = nullptr;
+			const auto  value = std::strtoull(start, &end, 0);
+			if (end == start) {
+				break;
+			}
+			if (format) {
+				formats.push_back(static_cast<int>(value));
+			} else {
+				addresses.push_back(value);
+			}
+			p = (*end == ',') ? end + 1 : end;
+		}
+	}
+
+	[[nodiscard]] bool Contains(uint64_t address, int format, uint64_t size) const {
+		return std::find(addresses.begin(), addresses.end(), address) != addresses.end() ||
+		       (size <= 4096u && std::find(formats.begin(), formats.end(), format) != formats.end());
+	}
+
+	void Contents(uint64_t frame, uint64_t address, const void* data, uint64_t size,
+	              int format) const {
+		const auto* dwords = static_cast<const uint32_t*>(data);
+		const auto  count  = static_cast<size_t>(size / 4);
+		char        text[1600] = {};
+		size_t      used = 0, shown = 0, nonzero = 0;
+		for (size_t i = 0; i < count; i++) {
+			if (dwords[i] == 0) {
+				continue;
+			}
+			nonzero++;
+			if (shown >= 48 || used >= sizeof(text) - 64) {
+				continue;
+			}
+			float as_float = 0.0f;
+			std::memcpy(&as_float, &dwords[i], sizeof(as_float));
+			const int n = format == static_cast<int>(vk::Format::eR32G32B32A32Sfloat)
+			                  ? std::snprintf(text + used, sizeof(text) - used, " +%zx=%g",
+			                                  i * 4, static_cast<double>(as_float))
+			                  : std::snprintf(text + used, sizeof(text) - used, " +%zx=%08x",
+			                                  i * 4, dwords[i]);
+			if (n < 0) {
+				break;
+			}
+			used += static_cast<size_t>(n);
+			shown++;
+		}
+		std::fprintf(stderr, "value log: frame %llu copy-back 0x%llx vk %d: %zu non-zero dwords%s\n",
+		             static_cast<unsigned long long>(frame),
+		             static_cast<unsigned long long>(address), format, nonzero, text);
+	}
+};
+
+const ValueLog g_value_log;
+
+// Debug aid (issue 22), KYTY_IMAGE_READ_WATCH: after an image copy-back lands in guest memory,
+// the next guest access to each of its pages faults once and is recorded, with the instruction
+// and thread that made it. Shows whether the title's CPU reads what the GPU computed.
+struct ReadWatch {
+	struct Image {
+		uint64_t size   = 0;
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		int      format = 0;
+		bool     tiled  = false;
+	};
+	struct Site {
+		uint64_t    count = 0;
+		std::string thread;
+	};
+	struct Stats {
+		Image                              image;
+		uint64_t                           copy_backs = 0, reads = 0, writes = 0, outside = 0;
+		std::unordered_map<uint64_t, Site> sites;
+	};
+	struct Armed {
+		uint64_t image_address = 0;
+	};
+
+	bool                                  enabled = std::getenv("KYTY_IMAGE_READ_WATCH") != nullptr;
+	uint64_t                              max_size = 1024u * 1024u;
+	std::mutex                            mutex;
+	std::unordered_map<uint64_t, Armed>   armed;
+	std::map<uint64_t, Stats>             stats;
+	uint64_t                              total_reads = 0, total_writes = 0, total_copy_backs = 0;
+	int64_t                               last_report_ns = 0;
+
+	void ReportLocked() {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns == 0) {
+			last_report_ns = now;
+			return;
+		}
+		if (now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr,
+		             "read watch: %llu copy-backs armed, %llu guest reads, %llu guest writes, %zu "
+		             "pages armed\n",
+		             static_cast<unsigned long long>(total_copy_backs),
+		             static_cast<unsigned long long>(total_reads),
+		             static_cast<unsigned long long>(total_writes), armed.size());
+		std::vector<std::pair<uint64_t, Stats*>> touched;
+		for (auto& [address, s]: stats) {
+			if (s.reads + s.writes != 0) {
+				touched.emplace_back(address, &s);
+			}
+		}
+		std::sort(touched.begin(), touched.end(), [](const auto& a, const auto& b) {
+			return a.second->reads + a.second->writes > b.second->reads + b.second->writes;
+		});
+		if (touched.size() > 24) {
+			touched.resize(24);
+		}
+		for (const auto& [address, s]: touched) {
+			std::vector<std::pair<uint64_t, const Site*>> sites;
+			for (const auto& [rip, site]: s->sites) {
+				sites.emplace_back(rip, &site);
+			}
+			std::sort(sites.begin(), sites.end(),
+			          [](const auto& a, const auto& b) { return a.second->count > b.second->count; });
+			char text[512] = {};
+			size_t used = 0;
+			for (size_t i = 0; i < sites.size() && i < 4 && used < sizeof(text); i++) {
+				const int n = std::snprintf(text + used, sizeof(text) - used, " 0x%llx x%llu [%s]",
+				                            static_cast<unsigned long long>(sites[i].first),
+				                            static_cast<unsigned long long>(sites[i].second->count),
+				                            sites[i].second->thread.c_str());
+				if (n < 0) {
+					break;
+				}
+				used += static_cast<size_t>(n);
+			}
+			std::fprintf(stderr,
+			             "read watch:   0x%llx %ux%u %s vk %d %llu B: copy-backs %llu, reads %llu, "
+			             "writes %llu, outside the image %llu; at%s\n",
+			             static_cast<unsigned long long>(address), s->image.width, s->image.height,
+			             s->image.tiled ? "tiled" : "linear", s->image.format,
+			             static_cast<unsigned long long>(s->image.size),
+			             static_cast<unsigned long long>(s->copy_backs),
+			             static_cast<unsigned long long>(s->reads),
+			             static_cast<unsigned long long>(s->writes),
+			             static_cast<unsigned long long>(s->outside), text);
+		}
+		std::vector<std::pair<uint64_t, const Stats*>> untouched;
+		for (const auto& [address, s]: stats) {
+			if (s.reads + s.writes == 0) {
+				untouched.emplace_back(address, &s);
+			}
+		}
+		std::sort(untouched.begin(), untouched.end(), [](const auto& a, const auto& b) {
+			return a.second->copy_backs > b.second->copy_backs;
+		});
+		for (size_t i = 0; i < untouched.size() && i < 8; i++) {
+			const auto& s = *untouched[i].second;
+			std::fprintf(stderr,
+			             "read watch:   not touched: 0x%llx %ux%u %s vk %d %llu B, copy-backs %llu\n",
+			             static_cast<unsigned long long>(untouched[i].first), s.image.width,
+			             s.image.height, s.image.tiled ? "tiled" : "linear", s.image.format,
+			             static_cast<unsigned long long>(s.image.size),
+			             static_cast<unsigned long long>(s.copy_backs));
+		}
+		stats.clear();
+		total_reads = total_writes = total_copy_backs = 0;
+	}
+} g_read_watch;
+
+} // namespace
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -1928,10 +2297,40 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
+	const ReadWatch::Image watch_image {range.size, image.info.extent.width,
+	                                   image.info.extent.height,
+	                                   static_cast<int>(image.info.pixel_format),
+	                                   image.info.IsTiled()};
+	const uint64_t value_frame =
+	    g_value_log.Contains(range.address, watch_image.format, range.size)
+	        ? DrawDumpFrameIndex() + 1
+	        : 0;
 	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
+	                                    trapped = m_readback_storage_images, watch_image,
+	                                    value_frame] {
 		download.buffer->Invalidate(download.offset, range.size);
+		if (value_frame != 0) {
+			g_value_log.Contents(value_frame - 1, range.address, download.mapped, range.size,
+			                     watch_image.format);
+		}
 		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		if (auto& watch = g_read_watch; watch.enabled && range.size <= watch.max_size) {
+			std::scoped_lock watch_lock {watch.mutex};
+			auto& s       = watch.stats[range.address];
+			s.image       = watch_image;
+			s.copy_backs++;
+			watch.total_copy_backs++;
+			const auto end = Common::AlignUp(range.address + range.size, TRACKER_PAGE_SIZE);
+			for (auto page = Common::AlignDown(range.address, TRACKER_PAGE_SIZE); page < end;
+			     page += TRACKER_PAGE_SIZE) {
+				auto [it, inserted] = watch.armed.try_emplace(page);
+				it->second.image_address = range.address;
+				if (inserted) {
+					m_page_manager.UpdatePageWatchers<true, true>(page, TRACKER_PAGE_SIZE);
+				}
+			}
+			watch.ReportLocked();
+		}
 		if (trapped) {
 			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			// Priority operations run in queue order, so this write-back is the oldest.
@@ -2119,13 +2518,46 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, "unmap");
 	}
 }
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	if (!m_heap_frees.empty() && tick % 64u == 0u) {
+		// KYTY_HEAP_STATS: frees of heap-selected images in the last 64 frames, most frequent first.
+		std::vector<std::pair<uint64_t, const std::string*>> top;
+		uint64_t                                             total = 0;
+		for (const auto& [key, count]: m_heap_frees) {
+			top.emplace_back(count, &key);
+			total += count;
+		}
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::fprintf(stderr, "heap frees: %" PRIu64 " frees of heap-selected images in 64 frames, %zu kinds\n",
+		             total, top.size());
+		for (size_t i = 0; i < top.size() && i < 8u; i++) {
+			std::fprintf(stderr, "heap frees:   x%" PRIu64 " %s\n", top[i].first, top[i].second->c_str());
+		}
+		m_heap_frees.clear();
+	}
+	if (!m_depth_replaces.empty() && tick % 64u == 0u) {
+		// KYTY_HEAP_STATS: depth<->color replacements in the last 64 frames, most frequent first.
+		std::vector<std::pair<uint64_t, const std::string*>> top;
+		uint64_t                                             total = 0;
+		for (const auto& [key, count]: m_depth_replaces) {
+			top.emplace_back(count, &key);
+			total += count;
+		}
+		std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::fprintf(stderr, "depth replaces: %" PRIu64 " in 64 frames, %zu kinds\n", total,
+		             top.size());
+		for (size_t i = 0; i < top.size() && i < 12u; i++) {
+			std::fprintf(stderr, "depth replaces:   x%" PRIu64 " %s\n", top[i].first,
+			             top[i].second->c_str());
+		}
+		m_depth_replaces.clear();
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -2167,7 +2599,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			--deletions;
-			FreeImage(id);
+			FreeImage(id, "gc");
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2196,15 +2628,140 @@ bool TextureCache::WriteBackImages() {
 	return m_readback_storage_images && DownloadQueuedImages();
 }
 
+namespace {
+
+// Debug aid (issue 22), KYTY_READBACK_LOG: every two seconds, the images copied back to guest
+// memory since the last report, most frequent first.
+struct ReadbackLog {
+	struct Entry {
+		uint64_t size     = 0;
+		uint32_t width    = 0;
+		uint32_t height   = 0;
+		uint32_t layers   = 0;
+		uint32_t levels   = 0;
+		int      format   = 0;
+		int      guest    = 0;
+		bool     tiled    = false;
+		bool     target   = false;
+		bool     storage  = false;
+		uint64_t count    = 0;
+	};
+	bool                      enabled = std::getenv("KYTY_READBACK_LOG") != nullptr;
+	std::map<uint64_t, Entry> entries;
+	uint64_t                  calls = 0, downloads = 0, bytes = 0;
+	int64_t                   last_report_ns = 0;
+
+	void Report() {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns == 0) {
+			last_report_ns = now;
+			return;
+		}
+		if (now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr, "readback log: %llu queue drains, %llu image copy-backs, %.1f MiB, %zu images\n",
+		             static_cast<unsigned long long>(calls), static_cast<unsigned long long>(downloads),
+		             static_cast<double>(bytes) / 1048576.0, entries.size());
+		std::vector<std::pair<uint64_t, Entry>> top(entries.begin(), entries.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+		if (top.size() > 16) {
+			top.resize(16);
+		}
+		for (const auto& [address, e]: top) {
+			std::fprintf(stderr,
+			             "readback log:   0x%llx x%llu %ux%u layers %u levels %u %s%s%s vk %d guest %d "
+			             "%llu B\n",
+			             static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(e.count), e.width, e.height, e.layers,
+			             e.levels, e.tiled ? "tiled" : "linear", e.target ? " target" : "",
+			             e.storage ? " shader-write" : "", e.format, e.guest,
+			             static_cast<unsigned long long>(e.size));
+		}
+		entries.clear();
+		calls = downloads = bytes = 0;
+	}
+} g_readback_log;
+
+
+} // namespace
+
+void TextureCache::NoteReadWatchFault(bool write, uint64_t address, uint64_t rip) noexcept {
+	auto& watch = g_read_watch;
+	if (!watch.enabled) {
+		return;
+	}
+	const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	std::scoped_lock lock {watch.mutex};
+	const auto it = watch.armed.find(page);
+	if (it == watch.armed.end()) {
+		return;
+	}
+	const auto image_address = it->second.image_address;
+	watch.armed.erase(it);
+	m_page_manager.UpdatePageWatchers<false, true>(page, TRACKER_PAGE_SIZE);
+	auto& s = watch.stats[image_address];
+	(write ? s.writes : s.reads)++;
+	(write ? watch.total_writes : watch.total_reads)++;
+	if (address < image_address || address >= image_address + s.image.size) {
+		s.outside++;
+	}
+	if (g_value_log.Contains(image_address, s.image.format, s.image.size)) {
+		std::fprintf(stderr, "value log: frame %llu guest %s 0x%llx (+%llx) at 0x%llx\n",
+		             static_cast<unsigned long long>(DrawDumpFrameIndex()), write ? "write" : "read",
+		             static_cast<unsigned long long>(image_address),
+		             static_cast<unsigned long long>(address - image_address),
+		             static_cast<unsigned long long>(rip));
+	}
+	auto& site = s.sites[rip];
+	if (site.count++ == 0) {
+		char name[64] = "(host thread)";
+		if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (LibKernel::PthreadGetname(self, name) != 0) {
+				std::snprintf(name, sizeof(name), "(unnamed)");
+			}
+		}
+		site.thread = name;
+	}
+}
+
 bool TextureCache::DownloadQueuedImages() {
 	std::scoped_lock lock {m_lock};
 	bool             downloaded = false;
+	auto&            log        = g_readback_log;
+	log.calls += log.enabled ? 1u : 0u;
 	for (const auto id: m_download_images) {
-		if (m_slot_images[id].IsGpuModified()) {
-			downloaded |= DownloadImageMemory(id);
+		auto& image = m_slot_images[id];
+		if (image.IsGpuModified()) {
+			const bool done = DownloadImageMemory(id);
+			downloaded |= done;
+			if (done && log.enabled) {
+				const auto& info  = image.info;
+				auto&       entry = log.entries[info.data.address];
+				entry.size        = info.data.size;
+				entry.width       = info.extent.width;
+				entry.height      = info.extent.height;
+				entry.layers      = info.resources.layers;
+				entry.levels      = info.resources.levels;
+				entry.format      = static_cast<int>(info.pixel_format);
+				entry.guest       = static_cast<int>(info.guest_format);
+				entry.tiled       = info.IsTiled();
+				entry.target      = image.usage.render_target;
+				entry.storage     = image.binding.shader_write;
+				entry.count++;
+				log.downloads++;
+				log.bytes += info.data.size;
+			}
 		}
 	}
 	m_download_images.clear();
+	if (log.enabled) {
+		log.Report();
+	}
 	return downloaded;
 }
 

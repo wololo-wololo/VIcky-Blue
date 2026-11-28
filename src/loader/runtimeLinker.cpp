@@ -19,6 +19,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/waitDebug.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -660,14 +661,16 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			// reads zero.
 			uint32_t value = 0;
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
-			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+			                                            info->exception_address, info->rsp, info->rbp)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 				return true;
 			}
 			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 			return true;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+		                                            info->exception_address, info->rsp, info->rbp)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
@@ -1669,6 +1672,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
 	const bool patch_guest_instructions =
 	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
+	if (Libs::LibKernel::WaitDebug::GuestTimeScale() > 1) {
+		std::fprintf(stderr, "guest time scale: %llu (guest TSC %s, wait timeout scale %llu)\n",
+		             static_cast<unsigned long long>(Libs::LibKernel::WaitDebug::GuestTimeScale()),
+		             tsc_multiplier != 0 ? "patched" : "NOT patched: run with --guest-tsc",
+		             static_cast<unsigned long long>(Libs::LibKernel::WaitDebug::Scale()));
+	}
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1680,6 +1689,13 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	if (std::getenv("KYTY_IMAGE_READ_WATCH") != nullptr) {
+		// Lets the read watch's instruction addresses be mapped to module offsets.
+		std::fprintf(stderr, "read watch: module %s base 0x%llx size 0x%llx\n",
+		             Common::PathToString(program->file_name.filename()).c_str(),
+		             static_cast<unsigned long long>(program->base_vaddr),
+		             static_cast<unsigned long long>(program->mapped_size));
+	}
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
 	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 

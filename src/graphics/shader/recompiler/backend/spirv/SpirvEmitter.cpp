@@ -19,6 +19,22 @@ namespace {
 
 } // namespace
 
+uint32_t LoopCap() {
+	static const uint32_t cap = [] {
+		const char* text = std::getenv("KYTY_LOOP_CAP");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 0)) : 0u;
+	}();
+	return cap;
+}
+
+bool PreciseWrites() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_PRECISE_WRITES");
+		return text != nullptr && std::strtoul(text, nullptr, 0) != 0u;
+	}();
+	return enabled;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   IR::PushData::Window push_data, const Profile& profile,
                                   bool emit_debug_info) {

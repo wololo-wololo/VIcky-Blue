@@ -11,7 +11,7 @@ uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
 	return value;
 }
 
-static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
+uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
 	if (state.program.bindings.UsesPushData()) return EmitPushDataLoad(state, dword_index);
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();

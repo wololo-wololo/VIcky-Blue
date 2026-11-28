@@ -1071,7 +1071,7 @@ void Presenter::Impl::Present() {
 		auto&      command = present_scheduler.BeginCommand();
 		const bool draw_system_overlay = [&] {
 			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			return (overlay_visual.active || PerformanceOverlayEnabled() || DrawDumpEnabled()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],

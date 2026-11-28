@@ -5393,6 +5393,8 @@ public:
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
+    // The readback windows below are laid out for 512 KiB.
+    const auto default_window = BufferCache::SetDownloadWindow(0x80000);
     constexpr uint64_t allocation_size = 0x5000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t first_offset = 0x100;
@@ -6464,6 +6466,7 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    BufferCache::SetDownloadWindow(default_window);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -7125,8 +7128,8 @@ public:
   // The fault scan reports each set page once and leaves the pages past its records set.
   void CheckFaultBufferScan() {
     constexpr const char *name = "FaultBufferScan";
-    constexpr u32 words = 2048;
-    constexpr u32 records = 1024; // Record 0 holds the count.
+    constexpr u32 words = 32768;
+    constexpr u32 records = FaultManager::MaxPageFaults; // Record 0 holds the count.
     const vk::DescriptorSetLayoutBinding bindings[]{
         {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
         {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
@@ -7204,11 +7207,12 @@ public:
               "the scan lost, repeated or kept a reported page");
     };
     // Bits in each word of a block, several in one word, and in the last word.
-    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17, 2047 * 32 + 31});
-    // 1200 pages, two per word, overflow the 1023 records; an odd record count leaves a word
+    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17,
+                    (words - 1) * 32 + 31});
+    // 18000 pages, two per word, overflow the 16383 records; an odd record count leaves a word
     // partly reported.
     std::vector<u32> overflow;
-    for (u32 i = 0; i < 600; i++) {
+    for (u32 i = 0; i < 9000; i++) {
       overflow.push_back((3 * i + 1) * 32 + i % 31);
       overflow.push_back((3 * i + 1) * 32 + 31);
     }
@@ -7225,7 +7229,7 @@ public:
   void CheckFaultRecordsOverflow() {
     constexpr const char *name = "FaultRecordsOverflow";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
-    constexpr u32 pages = 1216;
+    constexpr u32 pages = FaultManager::MaxPageFaults + 192;
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;
@@ -9497,6 +9501,94 @@ public:
                 "a raw block read did not view the clean BC image, or a raw writer or "
                 "raw image of other levels kept it");
         if (viewed) (void)texture_cache.FindTexture(raw_image, raw);
+      }
+
+      // Image heaps also select a BC texture and a raw block image of one of its mips at once,
+      // at different addresses. Neither heap lookup retires the other (each retirement made the
+      // other element stale, and its lookup retired the first again), and a GPU write to the raw
+      // image still reaches the BC texture.
+      {
+        const uint64_t address = base + 0x2000000;
+        constexpr uint32_t level = 1, levels = 7;
+        auto bc = MakeLinearDesc(address, 0, vk::Format::eBc4UnormBlock,
+            Prospero::BufferFormat::kBc4UNorm, Prospero::ImageType::kColor2D,
+            {256, 512, 1}, 1, 8, 1);
+        bc.info.resources.levels = levels;
+        bc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        bc.info.UpdateSize();
+        bc.view_info.level_count = levels;
+        bc.heap = true;
+        const auto mip = bc.info.mip_layout[level];
+        Require(name, "heap BC alias layout",
+                mip.offset != 0 && level < bc.info.first_tail_level &&
+                    mip.offset + mip.size <= bc.info.data.size,
+                "the raw mip under test starts at the BC address or lies in the mip tail");
+        std::memset(memory + (address - base), 0xff, bc.info.data.size);
+        auto raw = MakeLinearDesc(address + mip.offset, 0, vk::Format::eR32G32Uint,
+            Prospero::BufferFormat::k32_32UInt, Prospero::ImageType::kColor2D,
+            {mip.pitch, mip.height, 1}, 1, 8, 1);
+        raw.info.tile_mode = bc.info.tile_mode;
+        raw.info.UpdateSize();
+        raw.heap = true;
+
+        auto bc_lookup = bc;
+        const auto bc_image = texture_cache.FindImage(bc_lookup);
+        (void)texture_cache.FindTexture(bc_image, bc_lookup);
+        texture_cache.GetImage(bc_image).heap_refs.fetch_add(1u);
+        auto raw_lookup = raw;
+        const auto raw_image = texture_cache.FindImage(raw_lookup);
+        Require(name, "heap-selected BC alias kept",
+                raw_image && raw_image != bc_image &&
+                    TextureCacheTestAccess::Contains(texture_cache, bc_image),
+                "a raw heap lookup retired the heap-selected BC image");
+        (void)texture_cache.FindTexture(raw_image, raw_lookup);
+        texture_cache.GetImage(raw_image).heap_refs.fetch_add(1u);
+        for (uint32_t round = 0; round < 2; ++round) {
+          auto bc_again = bc;
+          auto raw_again = raw;
+          Require(name, "heap-selected BC aliases coexist",
+                  texture_cache.FindImage(bc_again) == bc_image &&
+                      texture_cache.FindImage(raw_again) == raw_image &&
+                      TextureCacheTestAccess::Contains(texture_cache, bc_image) &&
+                      TextureCacheTestAccess::Contains(texture_cache, raw_image),
+                  "heap lookups of a BC image and its raw mip retired each other");
+        }
+
+        constexpr uint32_t written = 0x2468ace0u;
+        vk::ClearValue clear{};
+        std::fill_n(clear.color.uint32.data(), 4, written);
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), raw_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        texture_cache.PublishBcAliasWrites();
+        Require(name, "raw write publishes to its BC alias",
+                TextureCacheTestAccess::Contains(texture_cache, bc_image) &&
+                    TextureCacheTestAccess::Contains(texture_cache, raw_image) &&
+                    !texture_cache.GetImage(raw_image).IsGpuModified() &&
+                    texture_cache.GetImage(bc_image).IsBufferModified(),
+                "a GPU write to the raw mip was not published to the heap-selected BC image");
+        (void)texture_cache.FindTexture(bc_image, bc_lookup);
+        std::vector<vk::BufferImageCopy> probes(2);
+        for (uint32_t probe = 0; probe < probes.size(); ++probe) {
+          probes[probe].bufferOffset = probe * 2 * sizeof(uint32_t);
+          probes[probe].imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                            probe == 0 ? 0u : level, 0, 1};
+          probes[probe].imageExtent = {4, 4, 1};
+        }
+        const std::vector<uint32_t> expected{UINT32_MAX, UINT32_MAX, written, written};
+        auto readback = CreateHostBuffer(name, expected.size() * sizeof(uint32_t),
+            vk::BufferUsageFlagBits::eTransferDst, std::vector<uint32_t>(expected.size()));
+        texture_cache.GetImage(bc_image).Download(probes, readback.buffer, 0, readback.size);
+        HostReadBarrier(readback.buffer, readback.size, vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "heap BC alias contents",
+                ReadBuffer(name, readback, expected.size()) == expected,
+                "the BC image lost the raw mip's GPU write or its other mips' guest bytes");
+        DestroyBuffer(&readback);
+        texture_cache.GetImage(bc_image).heap_refs.store(0u);
+        texture_cache.GetImage(raw_image).heap_refs.store(0u);
+        TextureCacheTestAccess::DeleteImage(texture_cache, raw_image);
+        TextureCacheTestAccess::DeleteImage(texture_cache, bc_image);
       }
 
       // A write through a separate buffer must not replace untouched image
@@ -20923,10 +21015,11 @@ public:
     }
 
     const bool uses_bda = Count(Kind::BdaPagetable) != 0;
-    Require(test.name, "dispatch",
-            uses_bda == (Count(Kind::FaultBuffer) != 0),
+    // Shaders recording their written binding pages use the fault buffer without the page table.
+    const bool uses_faults = Count(Kind::FaultBuffer) != 0;
+    Require(test.name, "dispatch", !uses_bda || uses_faults,
             "BDA page table and fault buffer must be bound together");
-    if (uses_bda) {
+    if (uses_bda || uses_faults) {
       EnsureBdaBuffers(test.name);
       bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
                             m_bda_pagetable_buffer.size};
@@ -20936,6 +21029,7 @@ public:
           std::pair{Kind::FaultBuffer, &fault_buffer_info},
       };
       for (const auto &[kind, info] : special_buffers) {
+        if (Count(kind) == 0) continue;
         vk::WriteDescriptorSet write{};
         write.sType = vk::StructureType::eWriteDescriptorSet;
         write.dstSet = descriptor_set;
@@ -20972,6 +21066,13 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        if (layout.write_pages) {
+          // The binding's offset in the test buffer stands in for its guest address.
+          shader_data[layout.WritePageDword() + 2 * index] =
+              static_cast<u32>(BufferCache::PageIndex(info.offset) + 2 * BufferCache::CACHING_NUMPAGES);
+          shader_data[layout.WritePageDword() + 2 * index + 1] =
+              static_cast<u32>(info.offset & (BufferCache::CACHING_PAGESIZE - 1));
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -25360,8 +25461,9 @@ private:
                        vk::BufferUsageFlagBits::eTransferDst;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
-    m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 4, usage | vk::BufferUsageFlagBits::eTransferSrc);
+    // Fault bits, device-address store bits, then binding store bits (KYTY_PRECISE_WRITES).
+    m_fault_buffer = CreateDeviceBuffer(shader_name, BufferCache::CACHING_NUMPAGES * 3 / 8,
+                                        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,

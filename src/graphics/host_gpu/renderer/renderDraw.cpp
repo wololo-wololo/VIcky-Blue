@@ -29,6 +29,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/waitDebug.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -37,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -44,7 +46,9 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <string>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1037,6 +1041,290 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// Debug aid (issue 22), KYTY_DRAW_DUMP=<dir>: for each guest frame, one line per draw with what it
+// consumes, to compare a frame that shows an object with one that lacks it. CPU side: programs,
+// targets, counts, and per-stage hashes of the user data, flattened SRT, buffer descriptors and
+// resolved buffer ranges. GPU side, copied just before the draw and read back after the frame: the
+// indirect records (the first decoded, instance counts summed) and the first 512 bytes of each
+// bound buffer. Frame n goes to <dir>/frame_<n % 64>.txt.
+namespace {
+
+struct DrawDumpFrame {
+	struct Copy {
+		uint64_t offset;
+		uint32_t size;
+		char     kind; // 'a' indirect records, 'b' bound buffer, 'x' buffer not resolvable
+	};
+	struct Record {
+		std::string       text;
+		std::vector<Copy> copies;
+		bool              indexed = false;
+		uint32_t          count   = 0;
+		uint32_t          stride  = 0;
+	};
+	std::unique_ptr<Buffer> readback;
+	uint64_t                used    = 0;
+	uint64_t                skipped = 0;
+	uint64_t                timeouts = 0;
+	std::vector<Record>     records;
+};
+
+struct DrawDumpState {
+	std::string                          dir;
+	std::mutex                           mutex;
+	std::vector<std::unique_ptr<Buffer>> free_buffers;
+	std::shared_ptr<DrawDumpFrame>       current;
+	uint64_t                             frame = 0;
+	std::atomic<uint64_t>                presented {0};
+	std::atomic<uint64_t>                recording {0};
+};
+
+std::atomic<uint64_t> g_draw_dump_packet {0};
+
+DrawDumpState& GetDrawDump() {
+	static DrawDumpState state;
+	return state;
+}
+
+constexpr uint64_t DrawDumpBufferSize   = 96ull << 20u;
+constexpr uint32_t DrawDumpBindingBytes = 512;
+constexpr uint32_t DrawDumpArgsBytes    = 64u << 10u;
+
+template <typename T>
+uint64_t DrawDumpHash(const std::vector<T>& values) {
+	return values.empty() ? 0 : XXH3_64bits(values.data(), values.size() * sizeof(T));
+}
+
+void DrawDumpRecord(RenderContext& context, vk::CommandBuffer vk_buffer, CommandBuffer& buffer,
+                    const DrawCallInfo& draw, const DrawTargets& targets,
+                    std::span<PreparedBindings* const> stages, const DrawIndexBufferSource& index_source,
+                    const DrawEmitInfo& emit, const std::pair<Buffer*, uint64_t>& args_buffer) {
+	auto&           dump = GetDrawDump();
+	std::lock_guard lock(dump.mutex);
+	if (!dump.current) {
+		dump.current = std::make_shared<DrawDumpFrame>();
+		if (!dump.free_buffers.empty()) {
+			dump.current->readback = std::move(dump.free_buffers.back());
+			dump.free_buffers.pop_back();
+		} else {
+			dump.current->readback = std::make_unique<Buffer>(
+			    context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::Download, 0,
+			    AllFlags, DrawDumpBufferSize);
+		}
+	}
+	auto&                 frame = *dump.current;
+	DrawDumpFrame::Record record;
+	char                  line[512];
+	std::snprintf(line, sizeof(line),
+	              "%zu rt=%llx/%u ds=%llx dw=%d ib=%llx n=%u inst=%u ind=%llx:%u:%u pkt=%llx",
+	              frame.records.size(),
+	              static_cast<unsigned long long>(
+	                  targets.color_count != 0 ? targets.colors[0].desc.info.data.address : 0),
+	              targets.color_count,
+	              static_cast<unsigned long long>(targets.depth.desc.info.data.address),
+	              targets.depth.depth_write_enable ? 1 : 0,
+	              static_cast<unsigned long long>(draw.indexed ? index_source.address : 0),
+	              draw.index_count, draw.instance_count,
+	              static_cast<unsigned long long>(emit.indirect.address), emit.indirect.count,
+	              emit.indirect.stride,
+	              static_cast<unsigned long long>(g_draw_dump_packet.load(std::memory_order_relaxed)));
+	record.text = line;
+	for (const auto* stage: stages) {
+		const auto* runtime = stage->runtime;
+		if (runtime == nullptr || runtime->module == nullptr || runtime->resources == nullptr) {
+			record.text += " stage=none";
+			continue;
+		}
+		const auto& resources = *runtime->resources;
+		std::vector<uint64_t> sources;
+		for (const auto& source: stage->buffer_sources) {
+			sources.push_back(source.address);
+			sources.push_back(source.size);
+		}
+		std::snprintf(line, sizeof(line), " stage=%llx ud=%016llx srt=%016llx desc=%016llx src=%016llx",
+		              static_cast<unsigned long long>(runtime->module->id),
+		              static_cast<unsigned long long>(DrawDumpHash(resources.user_data)),
+		              static_cast<unsigned long long>(DrawDumpHash(resources.flattened_srt)),
+		              static_cast<unsigned long long>(DrawDumpHash(resources.buffers)),
+		              static_cast<unsigned long long>(DrawDumpHash(sources)));
+		record.text += line;
+	}
+
+	std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
+	const auto add_copy = [&](vk::Buffer source, uint64_t offset, uint64_t size, char kind) {
+		const auto at = Common::AlignUp(frame.used, 16);
+		if (at + size > DrawDumpBufferSize) {
+			++frame.skipped;
+			record.copies.push_back({0, 0, 'x'});
+			return;
+		}
+		copies.emplace_back(source, vk::BufferCopy {offset, at, size});
+		record.copies.push_back({at, static_cast<uint32_t>(size), kind});
+		frame.used = at + size;
+	};
+	if (args_buffer.first != nullptr) {
+		const auto record_size = draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                      : sizeof(vk::DrawIndirectCommand);
+		const auto size = std::min<uint64_t>(
+		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride + record_size,
+		    DrawDumpArgsBytes);
+		record.indexed = draw.indexed;
+		record.count   = emit.indirect.count;
+		record.stride  = emit.indirect.stride;
+		add_copy(args_buffer.first->Handle(), args_buffer.second, size, 'a');
+	}
+	auto& cache = context.GetBufferCache();
+	for (const auto* stage: stages) {
+		for (const auto& source: stage->buffer_sources) {
+			if (source.address == 0 || source.size == 0) {
+				continue;
+			}
+			const auto size = std::min<uint64_t>(source.size, DrawDumpBindingBytes);
+			if (!source.id) {
+				record.copies.push_back({0, 0, 'x'});
+				continue;
+			}
+			auto& host = cache.GetBuffer(source.id);
+			if (host.is_deleted || !host.IsInBounds(source.address, size)) {
+				record.copies.push_back({0, 0, 'x'});
+				continue;
+			}
+			add_copy(host.Handle(), host.Offset(source.address), size, 'b');
+		}
+	}
+	frame.records.push_back(std::move(record));
+	if (copies.empty()) {
+		return;
+	}
+	buffer.EndRendering();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, before, {}, {});
+	for (const auto& [source, region]: copies) {
+		vk_buffer.copyBuffer(source, frame.readback->Handle(), region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eAllCommands |
+	                              vk::PipelineStageFlagBits::eHost,
+	                          {}, after, {}, {});
+}
+
+void DrawDumpWrite(const DrawDumpFrame& frame, uint64_t index) {
+	auto&      dump   = GetDrawDump();
+	const auto mapped = frame.readback->Mapped();
+	if (!frame.readback->IsCoherent() && frame.used != 0) {
+		frame.readback->Invalidate(0, frame.used);
+	}
+	const auto path = dump.dir + "/frame_" + std::to_string(index % 64u) + ".txt";
+	FILE*      file = std::fopen(path.c_str(), "w");
+	if (file == nullptr) {
+		return;
+	}
+	std::fprintf(file, "frame %llu draws %zu skipped-copies %llu timeouts %llu\n",
+	             static_cast<unsigned long long>(index), frame.records.size(),
+	             static_cast<unsigned long long>(frame.skipped),
+	             static_cast<unsigned long long>(frame.timeouts));
+	for (const auto& record: frame.records) {
+		std::fputs(record.text.c_str(), file);
+		uint32_t binding = 0;
+		for (const auto& copy: record.copies) {
+			if (copy.kind == 'x') {
+				std::fprintf(file, " b%u=none", binding++);
+				continue;
+			}
+			const auto* bytes = mapped.data() + copy.offset;
+			const auto  hash  = XXH3_64bits(bytes, copy.size);
+			if (copy.kind == 'b') {
+				std::fprintf(file, " b%u=%016llx", binding++, static_cast<unsigned long long>(hash));
+				continue;
+			}
+			// Indirect records: the hash, the first record, and the summed instance counts.
+			uint64_t instances = 0;
+			uint32_t zero      = 0;
+			for (uint32_t i = 0; i < record.count; i++) {
+				const uint64_t at = static_cast<uint64_t>(i) * record.stride + sizeof(uint32_t);
+				if (at + sizeof(uint32_t) > copy.size) {
+					break;
+				}
+				uint32_t value = 0;
+				std::memcpy(&value, bytes + at, sizeof(value));
+				instances += value;
+				zero += value == 0 ? 1u : 0u;
+			}
+			uint32_t first[5] {};
+			std::memcpy(first, bytes, std::min<size_t>(sizeof(first), copy.size));
+			std::fprintf(file, " args=%016llx r0=%u,%u,%u,%d,%u inst-sum=%llu zero=%u",
+			             static_cast<unsigned long long>(hash), first[0], first[1], first[2],
+			             static_cast<int32_t>(first[3]), record.indexed ? first[4] : 0u,
+			             static_cast<unsigned long long>(instances), zero);
+		}
+		std::fputc('\n', file);
+	}
+	std::fclose(file);
+}
+
+} // namespace
+
+bool DrawDumpEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_DUMP");
+		if (value == nullptr || *value == '\0') {
+			return false;
+		}
+		GetDrawDump().dir = value;
+		return true;
+	}();
+	return enabled;
+}
+
+uint64_t DrawDumpFlip(CommandScheduler& scheduler) {
+	if (!DrawDumpEnabled()) {
+		return 0;
+	}
+	auto&                          dump = GetDrawDump();
+	std::shared_ptr<DrawDumpFrame> frame;
+	uint64_t                       index = 0;
+	{
+		std::lock_guard lock(dump.mutex);
+		frame = std::move(dump.current);
+		dump.current.reset();
+		index = dump.frame++;
+		dump.recording.store(dump.frame);
+	}
+	const uint64_t timeouts = Libs::LibKernel::WaitDebug::FrameTimeouts().exchange(0);
+	if (frame) {
+		frame->timeouts = timeouts;
+		scheduler.DeferOperation([frame, index] {
+			DrawDumpWrite(*frame, index);
+			auto&           dump = GetDrawDump();
+			std::lock_guard lock(dump.mutex);
+			dump.free_buffers.push_back(std::move(frame->readback));
+		});
+	}
+	return index;
+}
+
+uint64_t DrawDumpFrameIndex() {
+	return GetDrawDump().recording.load();
+}
+
+void DrawDumpSetPacket(uint64_t address) {
+	g_draw_dump_packet.store(address, std::memory_order_relaxed);
+}
+
+void DrawDumpPresent(uint64_t frame) {
+	GetDrawDump().presented.store(frame);
+}
+
+uint64_t DrawDumpPresentedFrame() {
+	return GetDrawDump().presented.load();
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
@@ -1205,6 +1493,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
+	if (DrawDumpEnabled()) {
+		DrawDumpRecord(m_context, vk_buffer, buffer, draw, m_targets, stages, index_source, emit,
+		               args_buffer);
+	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
@@ -1223,6 +1515,35 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                       emit.indirect.count, emit.indirect.stride);
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	// Experiment (issue 22), KYTY_DRAW_BARRIER: 1 makes the shader writes of draws whose vertex or
+	// pixel stages write buffers or storage images visible to all later commands, as dispatches
+	// do; 2 does it after every draw.
+	static const int draw_barrier = [] {
+		const char* value = std::getenv("KYTY_DRAW_BARRIER");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (draw_barrier != 0) {
+		const auto writes_images = [](const auto& program) {
+			return std::ranges::any_of(program.info.images, [](const auto& image) {
+				return image.written &&
+				       image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+			});
+		};
+		bool writes = shader_write_stages != vk::PipelineStageFlags {} ||
+		              (state.ps_active && writes_images(state.ps_input_info.stage.module->info));
+		for (const auto& stage: vertex_stages) {
+			writes |= writes_images(stage.stage.module->info);
+		}
+		if (draw_barrier >= 2 || writes) {
+			static uint64_t count = 0;
+			if (++count % 20000u == 1u) {
+				std::fprintf(stderr, "draw barrier: %llu barriers after draws (mode %d)\n",
+				             static_cast<unsigned long long>(count), draw_barrier);
+			}
+			buffer.EndRendering();
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eAllGraphics);
+		}
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

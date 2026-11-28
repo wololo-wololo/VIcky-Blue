@@ -45,6 +45,10 @@
 
 namespace Libs::Graphics {
 
+// Debug aid (issue 22), KYTY_DRAW_DUMP: defined in renderDraw.cpp.
+bool     DrawDumpEnabled();
+uint64_t DrawDumpPresentedFrame();
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1837,7 +1841,8 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
+		    !DrawDumpEnabled()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1869,6 +1874,17 @@ struct SystemOverlay::Impl {
 		ImGui::NewFrame();
 		DrawSplash(frame_extent);
 		const float performance_bottom = DrawPerformanceOverlay(graphics, frame_extent);
+		if (DrawDumpEnabled()) {
+			// The guest frame being presented, stamped into the image for the draw dump.
+			const auto text = std::to_string(DrawDumpPresentedFrame());
+			auto*      draw = ImGui::GetForegroundDrawList();
+			const auto size = 0.05f * static_cast<float>(frame_extent.height);
+			const ImVec2 at {static_cast<float>(frame_extent.width) - 7.0f * size,
+			                 0.02f * static_cast<float>(frame_extent.height)};
+			draw->AddRectFilled({at.x - 0.2f * size, at.y - 0.1f * size},
+			                    {at.x + 6.8f * size, at.y + 1.2f * size}, IM_COL32(0, 0, 0, 255));
+			draw->AddText(nullptr, size, at, IM_COL32(255, 255, 0, 255), text.c_str());
+		}
 		GetOverlaySnapshot(&snapshot);
 		if (has_overlay && snapshot.session == prepared_session) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {

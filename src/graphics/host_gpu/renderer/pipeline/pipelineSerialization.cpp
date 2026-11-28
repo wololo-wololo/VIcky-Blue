@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
@@ -44,6 +45,13 @@ struct Frame {
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
 uint64_t BuildStamp() {
+	// Debug aid: KYTY_SHADER_STORE_STAMP=<n> keeps a store across rebuilds that leave the
+	// recompiler and its encoding unchanged. A wrong use loads stale shaders.
+	if (const char* text = std::getenv("KYTY_SHADER_STORE_STAMP"); text != nullptr) {
+		if (const auto stamp = std::strtoull(text, nullptr, 0); stamp != 0) {
+			return stamp;
+		}
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::array<wchar_t, 32768> name {};
 	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
@@ -69,7 +77,8 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	}
 	Writer header;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize,
+	      ShaderRecompiler::Spirv::LoopCap(), ShaderRecompiler::Spirv::PreciseWrites());
 	return std::move(header.bytes);
 }
 

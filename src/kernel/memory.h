@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -14,6 +16,17 @@ namespace Libs::LibKernel::Memory {
 
 void Initialize();
 void Shutdown();
+
+// Debug aid (issue 22, KYTY_ALIAS_LOG): direct-memory ranges mapped while another live mapping
+// shares their physical memory, one entry per side. Entries are removed when their own side is
+// unmapped, so a partner entry can outlive the alias.
+struct AliasedRange {
+	uint64_t vaddr;
+	uint64_t size;
+	uint64_t other_vaddr;
+};
+bool                      AliasLogEnabled();
+std::vector<AliasedRange> AliasedRanges();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
@@ -135,6 +148,9 @@ int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int 
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Debug aid: how many bytes from the host address are readable without a fault, up to max
+// (Windows: the committed, readable region that contains it; elsewhere 0).
+uint64_t               ReadableHostBytes(uint64_t address, uint64_t max);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.
@@ -146,7 +162,9 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr,
+                                  uint64_t fault_rip = 0, uint64_t fault_rsp = 0,
+                                  uint64_t fault_rbp = 0) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

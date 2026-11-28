@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/descriptors.h"
+#include "kernel/waitDebug.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -420,7 +421,8 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		if (*timo == 0) {
 			*out = owner->GetTriggeredEvents(ev, num);
 		} else {
-			*out = owner->WaitForEvents(ev, num, *timo);
+			*out = owner->WaitForEvents(ev, num, WaitDebug::ScaleUs(*timo));
+			WaitDebug::NoteWait(WaitDebug::Equeue, *timo, *out == 0);
 		}
 	}
 

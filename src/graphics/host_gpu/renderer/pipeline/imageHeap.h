@@ -45,6 +45,8 @@ public:
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
+	// The GPU wrote the range, or its GPU-written bytes were downloaded; on the GPU thread.
+	void NoteMetadataWrite(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	// At a suspend point.
 	void RunGarbageCollector();
@@ -144,6 +146,14 @@ private:
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
+	// DCC elements are re-resolved when their metadata may have changed: a watched metadata
+	// page was written by the guest or the GPU, an image was created, or a frame began.
+	void WatchDccMetadata(const std::vector<GuestRange>& ranges, bool replace);
+	std::unordered_map<uint64_t, uint8_t>             m_dcc_pages; // Page: unwatched since a write.
+	std::atomic<bool>                                 m_dcc_dirty {true};
+	uint64_t                                          m_dcc_serial = 0; // Image::serials.
+	uint64_t                                          m_frame      = 0; // Suspend points.
+	uint64_t                                          m_dcc_frame  = ~uint64_t {0};
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;
 	std::vector<uint32_t>                             m_scratch;

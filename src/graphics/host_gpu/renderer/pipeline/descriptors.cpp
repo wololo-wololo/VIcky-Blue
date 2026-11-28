@@ -108,7 +108,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    bool precise_writes) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -123,7 +124,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
+	    precise_writes);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -846,11 +848,27 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		                                              resource, buffer_offset, layout.write_pages);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+		if (layout.write_pages) {
+			// The written-bitmap bit of the page holding the binding's first byte, which sits
+			// buffer_offset bytes before the guest address, and that byte's offset in the page.
+			const auto& source = prepared.buffer_sources[index];
+			const auto  dword  = layout.WritePageDword() + 2u * index;
+			if (source.address == 0 || source.size == 0) {
+				// Guest page 0, which no binding covers; null bindings drop their stores anyway.
+				prepared.shader_data[dword] = static_cast<uint32_t>(2u * BufferCache::CACHING_NUMPAGES);
+			} else {
+				const auto first = source.address - buffer_offset;
+				prepared.shader_data[dword] = static_cast<uint32_t>(
+				    BufferCache::PageIndex(first) + 2u * BufferCache::CACHING_NUMPAGES);
+				prepared.shader_data[dword + 1u] =
+				    static_cast<uint32_t>(first & (BufferCache::CACHING_PAGESIZE - 1u));
+			}
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

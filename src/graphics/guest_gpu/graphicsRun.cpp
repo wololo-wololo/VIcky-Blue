@@ -22,16 +22,179 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_map>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Debug aid (issue 22), KYTY_FRAME_STATS: one stderr line per flip with what the command
+// processors ran since the last one, to see whether a static scene's draw counts vary per frame.
+struct FrameStats {
+	bool     enabled = std::getenv("KYTY_FRAME_STATS") != nullptr;
+	uint64_t frame = 0, draws = 0, indexed = 0, zero_instances = 0, instances = 0, multi = 0,
+	         multi_draws = 0, multi_counted = 0, multi_zero = 0, multi_gpu = 0, dispatches = 0,
+	         dispatches_indirect = 0, async_dispatches = 0, predicated = 0;
+
+	void Flip() {
+		if (!enabled) return;
+		std::fprintf(stderr,
+		             "frame stats: %llu draws %llu (indexed %llu, instances %llu, zero-instance "
+		             "%llu) multi %llu (draws %llu, from count %llu, zero %llu, on GPU %llu) "
+		             "dispatches %llu (indirect %llu, async %llu) predicated-skip %llu\n",
+		             static_cast<unsigned long long>(frame++),
+		             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed),
+		             static_cast<unsigned long long>(instances),
+		             static_cast<unsigned long long>(zero_instances),
+		             static_cast<unsigned long long>(multi),
+		             static_cast<unsigned long long>(multi_draws),
+		             static_cast<unsigned long long>(multi_counted),
+		             static_cast<unsigned long long>(multi_zero),
+		             static_cast<unsigned long long>(multi_gpu),
+		             static_cast<unsigned long long>(dispatches),
+		             static_cast<unsigned long long>(dispatches_indirect),
+		             static_cast<unsigned long long>(async_dispatches),
+		             static_cast<unsigned long long>(predicated));
+		const auto keep = frame;
+		*this           = {};
+		frame           = keep;
+	}
+} g_frame_stats;
+
+// Experiment (issue 22), KYTY_IB_CHECK: is any indirect command buffer the command processor
+// follows written by the GPU? Each one is noted when the command processor starts on it: whether
+// the buffer cache holds GPU data over it, and a hash of its contents. At every flip the GPU is
+// waited for (with a fault-buffer scan, so stores through device addresses are marked too), and
+// each buffer of the frame is checked again: written by the GPU since it was read, or changed.
+// A change without a GPU write can also be the guest CPU building its next frame in place.
+struct IbCheck {
+	struct Entry {
+		uint64_t address;
+		uint32_t num_dw;
+		uint64_t hash;
+		bool     gpu_at_read;
+	};
+	bool                                   enabled = std::getenv("KYTY_IB_CHECK") != nullptr;
+	std::vector<Entry>                     entries;
+	uint64_t                               frames = 0, buffers = 0, dwords = 0, gpu_at_read = 0,
+	         gpu_after_read = 0, changed = 0, changed_dwords = 0, gpu_stale = 0, gpu_stale_dwords = 0,
+	         gpu_same = 0;
+	std::unordered_map<uint64_t, uint64_t> gpu_addresses;
+	std::unordered_map<uint64_t, uint64_t> changed_addresses;
+	int64_t                                last_report_ns = 0;
+	uint32_t                               gpu_stale_reported = 0;
+
+	void Read(BufferCache& buffers_cache, const uint32_t* commands, uint32_t num_dw) {
+		const auto address = reinterpret_cast<uint64_t>(commands);
+		const auto size    = uint64_t {num_dw} * 4u;
+		// Before the hash: reading a GPU-modified page downloads it and clears the mark.
+		const bool gpu = buffers_cache.IsRegionGpuModified(address, size);
+		entries.push_back({address, num_dw, XXH3_64bits(commands, size), gpu});
+	}
+
+	static void Top(const char* what, std::unordered_map<uint64_t, uint64_t>& addresses) {
+		std::vector<std::pair<uint64_t, uint64_t>> top(addresses.begin(), addresses.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		if (top.size() > 6) {
+			top.resize(6);
+		}
+		std::fprintf(stderr, "ib check: %s:", what);
+		for (const auto& [address, count]: top) {
+			std::fprintf(stderr, " 0x%llx x%llu", static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(count));
+		}
+		std::fprintf(stderr, "\n");
+		addresses.clear();
+	}
+
+	void Flip(BufferCache& buffers_cache, CommandScheduler& scheduler) {
+		buffers_cache.ProcessFaultBuffer();
+		scheduler.Finish();
+		frames++;
+		for (const auto& entry: entries) {
+			const auto size = uint64_t {entry.num_dw} * 4u;
+			buffers++;
+			dwords += entry.num_dw;
+			gpu_at_read += entry.gpu_at_read ? 1u : 0u;
+			if (entry.gpu_at_read) {
+				gpu_addresses[entry.address]++;
+			}
+			const bool gpu_after = buffers_cache.IsRegionGpuModified(entry.address, size);
+			if (gpu_after) {
+				gpu_after_read++;
+				gpu_addresses[entry.address]++;
+			}
+			// The GPU is idle here: reading a GPU-modified page downloads its final contents.
+			const bool differs =
+			    XXH3_64bits(reinterpret_cast<const void*>(entry.address), size) != entry.hash;
+			if (entry.gpu_at_read || gpu_after) {
+				// Page-granular marks: the GPU may have written only beside the commands.
+				if (differs) {
+					gpu_stale++;
+					gpu_stale_dwords += entry.num_dw;
+					if (gpu_stale_reported++ < 24u) {
+						std::fprintf(stderr,
+						             "ib check: GPU-flagged buffer 0x%llx (%u dw, GPU data at read "
+						             "%d, written after %d) differs after the GPU ran\n",
+						             static_cast<unsigned long long>(entry.address), entry.num_dw,
+						             entry.gpu_at_read ? 1 : 0, gpu_after ? 1 : 0);
+					}
+				} else {
+					gpu_same++;
+				}
+				continue;
+			}
+			if (differs) {
+				changed++;
+				changed_dwords += entry.num_dw;
+				changed_addresses[entry.address]++;
+			}
+		}
+		entries.clear();
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		if (last_report_ns != 0 && now - last_report_ns < 2000000000LL) {
+			return;
+		}
+		last_report_ns = now;
+		std::fprintf(stderr,
+		             "ib check: %llu frames, %llu indirect buffers (%llu dw); GPU data at read %llu, "
+		             "GPU-written after read %llu; GPU-flagged unchanged %llu, differing %llu (%llu dw); "
+		             "other changed by the flip %llu (%llu dw)\n",
+		             static_cast<unsigned long long>(frames), static_cast<unsigned long long>(buffers),
+		             static_cast<unsigned long long>(dwords),
+		             static_cast<unsigned long long>(gpu_at_read),
+		             static_cast<unsigned long long>(gpu_after_read),
+		             static_cast<unsigned long long>(gpu_same),
+		             static_cast<unsigned long long>(gpu_stale),
+		             static_cast<unsigned long long>(gpu_stale_dwords),
+		             static_cast<unsigned long long>(changed),
+		             static_cast<unsigned long long>(changed_dwords));
+		if (!gpu_addresses.empty()) {
+			Top("GPU-written buffers", gpu_addresses);
+		}
+		if (!changed_addresses.empty()) {
+			Top("changed buffers", changed_addresses);
+		}
+		frames = buffers = dwords = gpu_at_read = gpu_after_read = changed = changed_dwords = 0;
+		gpu_stale = gpu_stale_dwords = gpu_same = 0;
+	}
+} g_ib_check;
+
+} // namespace
 
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
@@ -262,6 +425,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
+	m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -564,6 +728,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
+	if (g_ib_check.enabled) {
+		g_ib_check.Read(m_renderer.GetBufferCache(), commands.data(),
+		                static_cast<uint32_t>(commands.size()));
+	}
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
@@ -607,6 +775,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			++g_frame_stats.predicated;
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
 			cursor.offset_dw += packet_dw;
@@ -634,6 +803,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (!g_cp_op_keeps_draw_window[opcode]) {
 			m_renderer.GetBufferCache().EndDrawWindow();
 		}
+		DrawDumpSetPacket(reinterpret_cast<uint64_t>(packet));
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -702,6 +872,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
@@ -723,6 +894,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -735,7 +907,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 // Submits the recorded work every N draws so the host GPU starts before a long buffer ends.
+void CommandProcessor::PublishGpuWritesBeforeRead() {
+	m_renderer.PublishGpuWritesBeforeRead();
+}
+
 void CommandProcessor::CountDraw() {
+	m_renderer.PublishGpuWritesBeforeRead(); // Experiment (KYTY_SYNC_GPU_WRITES=2).
 	if (m_flush_draws == 0) {
 		return;
 	}
@@ -752,6 +929,10 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
+	++g_frame_stats.draws;
+	++g_frame_stats.indexed;
+	g_frame_stats.instances += args.instance_count;
+	g_frame_stats.zero_instances += args.instance_count == 0 ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
 }
 
@@ -823,7 +1004,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+	++g_frame_stats.multi;
+	g_frame_stats.multi_draws += draw_count;
+	g_frame_stats.multi_counted += count_addr != nullptr ? 1u : 0u;
 	if (draw_count == 0) {
+		++g_frame_stats.multi_zero;
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
@@ -838,6 +1023,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
 	if (IndirectDrawOffsets(registers, records.offsets)) {
 		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
+			++g_frame_stats.multi_gpu;
 			return;
 		}
 		if (indexed && m_index_buffer_size != 0 &&
@@ -845,6 +1031,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                                         .index_addr          = IndexAddress(0),
 		                                         .index_type_and_size = m_index_type_and_size,
 		                                         .indirect            = records})) {
+			++g_frame_stats.multi_gpu;
 			return;
 		}
 	}
@@ -879,6 +1066,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	++g_frame_stats.dispatches;
+	g_frame_stats.async_dispatches += IsAsyncComputeQueue() ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
 	                                              thread_group_z, mode, IsAsyncComputeQueue());
 }
@@ -897,6 +1086,9 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	++g_frame_stats.dispatches;
+	++g_frame_stats.dispatches_indirect;
+	g_frame_stats.async_dispatches += IsAsyncComputeQueue() ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }
@@ -906,13 +1098,29 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
+	++g_frame_stats.draws;
+	g_frame_stats.instances += args.instance_count;
+	g_frame_stats.zero_instances += args.instance_count == 0 ? 1u : 0u;
 	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(label);
+	// Keep running queued GPU-thread commands while this packet waits for the flip. Other threads
+	// send guest memory unmaps here synchronously; blocking for the whole flip held each of them
+	// for up to a frame and slowed the title's streaming loads to a crawl. ProcessPm4 already runs
+	// these commands between packets. Debug aid: KYTY_FLIP_WAIT_BLOCKING=1 restores the old wait.
+	static const bool run_commands = std::getenv("KYTY_FLIP_WAIT_BLOCKING") == nullptr;
+	auto&             video_out    = m_renderer.GetVideoOut();
+	if (!run_commands || g_gpu_state == nullptr) {
+		video_out.WaitFlipDone(label);
+		return;
+	}
+	g_gpu_state->ProcessCommands();
+	while (!video_out.WaitFlipDoneFor(label, 1000)) {
+		g_gpu_state->ProcessCommands();
+	}
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -945,8 +1153,26 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		return;
 	}
 
+	// Experiment (issue 22), KYTY_EARLY_IMAGE_READBACK: queued image copy-backs (render targets
+	// with --readback-linear-images / --readback-tiled-images) start before every end-of-pipe
+	// signal, not only at GL2 writebacks and the frame boundary. With --readback-storage-images
+	// guest accesses to their pages wait until the copies land.
+	static const bool early_image_readback = std::getenv("KYTY_EARLY_IMAGE_READBACK") != nullptr;
+	if (early_image_readback && !gl2_writeback) {
+		WriteBackImages();
+	}
+
+	// Experiment: pages written through device addresses become GPU-modified before the signal.
+	m_renderer.PublishGpuWrites();
+
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+
+	// Experiment (issue 22), KYTY_ALIAS_FLUSH: GPU writes in aliased ranges reach guest memory
+	// before the signal, for CPU reads through the other address.
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -1080,19 +1306,41 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
+	g_frame_stats.Flip();
+	if (g_ib_check.enabled) {
+		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
+	}
+	const auto dump_frame = DrawDumpFlip(GetScheduler());
+	m_renderer.WriteWatchFlip();
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
-	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, request, dump_frame] {
+		DrawDumpPresent(dump_frame);
+		renderer.GetVideoOut().CompleteFlip(request);
+	});
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	if (AliasFlushEnabled()) {
+		m_renderer.GetBufferCache().DownloadAliasedGpuWrites();
+	}
+	g_frame_stats.Flip();
+	if (g_ib_check.enabled) {
+		g_ib_check.Flip(m_renderer.GetBufferCache(), GetScheduler());
+	}
+	const auto dump_frame = DrawDumpFlip(GetScheduler());
+	m_renderer.WriteWatchFlip();
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
-	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	GetScheduler().DeferPriorityOperation([this, request_id, dump_frame] {
+		DrawDumpPresent(dump_frame);
+		m_renderer.GetVideoOut().CompleteFlip(request_id);
+	});
 	GetScheduler().Flush();
 }
 

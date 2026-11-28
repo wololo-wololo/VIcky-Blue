@@ -218,6 +218,7 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip();
 	void Wait(VideoOutConfig& cfg, int index);
+	bool WaitFor(VideoOutConfig& cfg, int index, uint32_t micros);
 
 private:
 	enum class RequestState { Reserved, Ready, Presenting };
@@ -1083,6 +1084,22 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+// Waits at most about `micros` for the flip on `index`; returns true once it is done.
+bool FlipQueue::WaitFor(VideoOutConfig& cfg, int index, uint32_t micros) {
+	Common::LockGuard lock(m_mutex);
+
+	auto has_request = [this, &cfg, index] {
+		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	};
+	if (!has_request()) {
+		return true;
+	}
+	m_done_cond_var.WaitFor(&m_mutex, micros);
+	return !has_request();
+}
+
 bool FlipQueue::Flip() {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1555,6 +1572,14 @@ void VideoOutDriver::WaitFlipDone(const uint64_t* label) {
 	EXIT_IF(ctx == nullptr);
 
 	m_impl->GetFlipQueue().Wait(*ctx, static_cast<int>(label - ctx->labels.data()));
+}
+
+bool VideoOutDriver::WaitFlipDoneFor(const uint64_t* label, uint32_t micros) {
+	auto* ctx = m_impl->GetByLabel(label);
+	EXIT_IF(ctx == nullptr);
+
+	return m_impl->GetFlipQueue().WaitFor(*ctx, static_cast<int>(label - ctx->labels.data()),
+	                                      micros);
 }
 
 uint64_t* VideoOutGetBufferLabels(int handle, int* bus) {

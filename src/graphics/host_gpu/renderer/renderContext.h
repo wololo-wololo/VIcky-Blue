@@ -57,12 +57,23 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
 
-	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
+	                               uint64_t fault_rip = 0, uint64_t fault_rsp = 0,
+	                               uint64_t fault_rbp = 0) noexcept;
+	// Debug aid (issue 22), KYTY_WRITE_WATCH: re-arms the one-shot write watch at a guest flip.
+	void WriteWatchFlip();
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Experiment for the object pop-in (KYTY_SYNC_GPU_WRITES): hands the pages that shaders wrote
+	// through device addresses to the buffer cache now, and waits for the GPU, so the guest's next
+	// read of them downloads the written bytes.
+	void               PublishGpuWrites();
+	// Same, with KYTY_SYNC_GPU_WRITES=2 only: also before the command processor reads a condition
+	// from guest memory (COND_EXEC, branch, predication, WAIT_REG_MEM) and before draws.
+	void               PublishGpuWritesBeforeRead();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

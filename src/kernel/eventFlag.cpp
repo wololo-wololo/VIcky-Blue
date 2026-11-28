@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "kernel/waitDebug.h"
 
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -142,7 +143,8 @@ int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
 	m_waiters++;
 
 	const uint64_t start    = Common::SteadyNs();
-	const uint64_t deadline = (timeout != nullptr ? TickDeadline(start, *timeout) : UINT64_MAX);
+	const uint64_t deadline =
+	    (timeout != nullptr ? TickDeadline(start, WaitDebug::ScaleUs(*timeout)) : UINT64_MAX);
 	for (uint64_t now = start; !waiter.released && now < deadline; now = Common::SteadyNs()) {
 		if (timeout == nullptr) {
 			waiter.cond_var.Wait(&m_mutex);
@@ -156,7 +158,8 @@ int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
 		waiter.error  = KERNEL_ERROR_ETIMEDOUT;
 	}
 	if (timeout != nullptr) {
-		const uint64_t elapsed = (Common::SteadyNs() - start) / 1000;
+		WaitDebug::NoteWait(WaitDebug::EventFlag, *timeout, !waiter.released);
+		const uint64_t elapsed = (Common::SteadyNs() - start) / 1000 / WaitDebug::Scale();
 		*timeout = (elapsed < *timeout ? *timeout - static_cast<KernelUseconds>(elapsed) : 0);
 	}
 	if (--m_waiters == 0 && m_deleted) {

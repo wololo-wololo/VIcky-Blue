@@ -11,6 +11,13 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 
+#include <functional>
+#include <vector>
+#include <map>
+#include <filesystem>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <iterator>
@@ -277,8 +284,71 @@ void ImageHeap::Unwatch(const Memory& memory) {
 	    [&](size_t begin, size_t end) { Watch<false>(memory, begin, end); });
 }
 
+void ImageHeap::WatchDccMetadata(const std::vector<GuestRange>& ranges, bool replace) {
+	std::scoped_lock lock {m_mutex};
+	if (replace) {
+		for (auto& [page, dirty]: m_dcc_pages) dirty |= 2u; // Unneeded until a range claims it.
+	}
+	for (const auto& range: ranges) {
+		if (!range.Valid()) continue;
+		const auto end = Common::AlignUp(range.address + range.size, TRACKER_PAGE_SIZE);
+		for (auto page = Common::AlignDown(range.address, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			const auto [entry, added] = m_dcc_pages.try_emplace(page, uint8_t {0});
+			if (added) {
+				m_page_manager.UpdatePageWatchers<true>(page, TRACKER_PAGE_SIZE);
+				// It was read before the watch: read it again.
+				m_dcc_dirty.store(true, std::memory_order_relaxed);
+			} else {
+				entry->second &= 1u;
+			}
+		}
+	}
+	if (replace) {
+		std::erase_if(m_dcc_pages, [&](const auto& entry) {
+			if ((entry.second & 2u) == 0u) return false;
+			if ((entry.second & 1u) == 0u) {
+				m_page_manager.UpdatePageWatchers<false>(entry.first, TRACKER_PAGE_SIZE);
+			}
+			return true;
+		});
+	}
+}
+
+void ImageHeap::NoteMetadataWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_mutex};
+	if (m_dcc_pages.empty()) return;
+	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	bool       hit   = false;
+	if ((end - begin) / TRACKER_PAGE_SIZE <= m_dcc_pages.size()) {
+		for (auto page = begin; page < end && !hit; page += TRACKER_PAGE_SIZE) {
+			hit = m_dcc_pages.contains(page);
+		}
+	} else {
+		hit = std::ranges::any_of(m_dcc_pages, [&](const auto& entry) {
+			return entry.first >= begin && entry.first < end;
+		});
+	}
+	if (hit) m_dcc_dirty.store(true, std::memory_order_relaxed);
+}
+
 void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_mutex};
+	if (!m_dcc_pages.empty()) {
+		const auto end = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		for (auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE); page < end;
+		     page += TRACKER_PAGE_SIZE) {
+			if (const auto found = m_dcc_pages.find(page); found != m_dcc_pages.end()) {
+				// The write must not fault again, so the page stays unwatched until it is read.
+				if ((found->second & 1u) == 0u) {
+					found->second |= 1u;
+					m_page_manager.UpdatePageWatchers<false>(page, TRACKER_PAGE_SIZE);
+				}
+				m_dcc_dirty.store(true, std::memory_order_relaxed);
+			}
+		}
+	}
 	for (auto& memory: m_memories) {
 		// Watches cover whole pages, so a write next to the table must unwatch its page too.
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
@@ -495,9 +565,66 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 	}
 }
 
+namespace {
+
+// Debug aid (KYTY_HEAP_STATS): where Rebind spends its time, reported every 4096 calls.
+struct RebindStats {
+	using Clock = std::chrono::steady_clock;
+	bool              enabled = std::getenv("KYTY_HEAP_STATS") != nullptr;
+	uint64_t          calls = 0, dcc = 0, held = 0, held_runs = 0, pending = 0, changes = 0;
+	uint64_t          elements = 0, stale_calls = 0;
+	Clock::duration   t_changes {}, t_dcc {}, t_held {}, t_repoint {}, t_pending {}, t_write {};
+	Clock::time_point mark;
+	void Start() { if (enabled) mark = Clock::now(); }
+	void Lap(Clock::duration& into) {
+		if (!enabled) return;
+		const auto now = Clock::now();
+		into += now - mark;
+		mark = now;
+	}
+	bool dcc_once = false; // Unused; kept in the report line.
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> gone; // address -> (size, count)
+	void Report() {
+		if (!enabled || ++calls % 4096u != 0u) return;
+		const auto ms = [](Clock::duration d) {
+			return std::chrono::duration<double, std::milli>(d).count();
+		};
+		std::fprintf(stderr,
+		             "heap stats: calls=4096 elements=%llu changes=%llu dcc=%llu held=%llu/%llu runs "
+		             "pending=%llu stale_calls=%llu | ms changes=%.0f dcc=%.0f held=%.0f repoint=%.0f "
+		             "pending=%.0f write=%.0f dcc_once=%d\n",
+		             static_cast<unsigned long long>(elements), static_cast<unsigned long long>(changes),
+		             static_cast<unsigned long long>(dcc), static_cast<unsigned long long>(held),
+		             static_cast<unsigned long long>(held_runs), static_cast<unsigned long long>(pending),
+		             static_cast<unsigned long long>(stale_calls), ms(t_changes), ms(t_dcc), ms(t_held),
+		             ms(t_repoint), ms(t_pending), ms(t_write), int(dcc_once));
+		std::vector<std::pair<uint64_t, uint64_t>> top; // (count, address)
+		for (const auto& [address, entry]: gone) top.emplace_back(entry.second, address);
+		std::ranges::sort(top, std::greater<>());
+		std::fprintf(stderr, "heap churn: %zu addresses left the cache;", gone.size());
+		for (size_t i = 0; i < top.size() && i < 6; ++i) {
+			std::fprintf(stderr, " 0x%llx+0x%llx x%llu",
+			             static_cast<unsigned long long>(top[i].second),
+			             static_cast<unsigned long long>(gone[top[i].second].first),
+			             static_cast<unsigned long long>(top[i].first));
+		}
+		std::fprintf(stderr, "\n");
+		gone.clear();
+		dcc = held = held_runs = pending = changes = stale_calls = 0;
+		t_changes = t_dcc = t_held = t_repoint = t_pending = t_write = {};
+	}
+} g_rebind_stats;
+
+} // namespace
+
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
+	auto& stats = g_rebind_stats;
+	stats.Start();
 	auto& textures = m_context.GetTextureCache();
+	// Earlier draws are recorded, so their writes to images with selected BC aliases publish now
+	// and the aliases' changes are taken below.
+	textures.PublishBcAliasWrites();
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {
@@ -512,7 +639,17 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return static_cast<bool>(id);
 	});
+	stats.changes += m_changes.size();
+	if (stats.enabled) {
+		for (const auto& change: m_changes) {
+			auto& entry = stats.gone[change.data.address];
+			entry.first = change.data.size;
+			++entry.second;
+		}
+	}
+	stats.elements = m_elements.size();
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	stats.Lap(stats.t_changes);
 	const auto resolve = [&](const Element& element) {
 		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
 		return executor.ResolveTexture(resource, element.key.value);
@@ -531,15 +668,64 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		stale = true;
 		return true;
 	};
-	// Discovery applies the color metadata clears written since the last draw.
-	std::erase_if(m_dcc, retry);
+	// Discovery applies the color metadata clears written since the last draw. Resolving every
+	// DCC element on every draw is the largest cost of discovery, so it runs only when a clear
+	// may have been written: a watched metadata page was written by the guest or the GPU, an
+	// image was created or changed identity, or a frame began. KYTY_DCC_EVERY_CALL restores the
+	// pass on every draw.
+	static const bool dcc_every_call = std::getenv("KYTY_DCC_EVERY_CALL") != nullptr;
+	const bool        dcc_written    = m_dcc_dirty.exchange(false, std::memory_order_relaxed);
+	const auto        dcc_serial     = Image::serials.load(std::memory_order_relaxed);
+	if (dcc_every_call || dcc_written || stale || m_dcc_serial != dcc_serial ||
+	    m_dcc_frame != m_frame) {
+		m_dcc_frame  = m_frame;
+		m_dcc_serial = dcc_serial;
+		{
+			// Watch before reading, so a write during the read faults the page again.
+			std::scoped_lock lock {m_mutex};
+			for (auto& [page, dirty]: m_dcc_pages) {
+				if ((dirty & 1u) != 0u) {
+					dirty &= ~uint8_t {1};
+					m_page_manager.UpdatePageWatchers<true>(page, TRACKER_PAGE_SIZE);
+				}
+			}
+		}
+		stats.dcc += m_dcc.size();
+		std::vector<GuestRange> metadata;
+		metadata.reserve(m_dcc.size());
+		std::erase_if(m_dcc, [&](uint32_t index) {
+			const auto& element = m_elements[index];
+			if (element.state != State::Live) return true;
+			const auto binding = resolve(element);
+			if (binding.image_id == element.image &&
+			    (!element.image ||
+			     textures.m_slot_images[element.image].serial == element.serial)) {
+				if (!element.image && binding.desc.info.data.Empty()) return true;
+				metadata.push_back(binding.desc.info.metadata.range);
+				return false;
+			}
+			Mark(index, State::Stale);
+			stale = true;
+			return true;
+		});
+		WatchDccMetadata(metadata, true);
+	}
+	stats.Lap(stats.t_dcc);
 	// Held elements retry once an image is created, such as a render target of their extent.
 	if (const auto serial = Image::serials.load(std::memory_order_relaxed);
 	    m_held_serial != serial) {
 		m_held_serial = serial;
+		stats.held += m_held.size();
+		++stats.held_runs;
 		std::erase_if(m_held, retry);
 	}
-	if (stale) Repoint();
+	stats.Lap(stats.t_held);
+	if (stale) {
+		++stats.stale_calls;
+		Repoint();
+	}
+	stats.Lap(stats.t_repoint);
+	stats.pending += m_pending.size();
 	for (const auto index: m_pending) {
 		if (m_elements[index].refs == 0u) continue;
 		auto binding = resolve(m_elements[index]);
@@ -552,7 +738,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			element.serial     = image.serial;
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
-			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
+			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+				m_dcc.push_back(index);
+				WatchDccMetadata({binding.desc.info.metadata.range}, false);
+			}
 			m_away.emplace_back(image.serial, binding.image_id);
 		} else if (!binding.desc.info.data.Empty()) {
 			m_held.push_back(index);
@@ -560,7 +749,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		m_writes.push_back({index, {nullptr, binding.image_view, binding.layout}});
 	}
 	m_pending.clear();
+	stats.Lap(stats.t_pending);
 	WriteDescriptors();
+	stats.Lap(stats.t_write);
+	stats.Report();
 }
 
 void ImageHeap::WriteDescriptors() {
@@ -644,6 +836,16 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::erase_if(m_changes, other);
 	std::scoped_lock lock {m_mutex};
+	std::erase_if(m_dcc_pages, [&](const auto& entry) {
+		if (entry.first + TRACKER_PAGE_SIZE <= address || entry.first >= address + size) {
+			return false;
+		}
+		if ((entry.second & 1u) == 0u) {
+			m_page_manager.UpdatePageWatchers<false>(entry.first, TRACKER_PAGE_SIZE);
+		}
+		m_dcc_dirty.store(true, std::memory_order_relaxed);
+		return true;
+	});
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		if (address >= memory->base + memory->size || memory->base >= address + size) {
 			return false;
@@ -665,6 +867,7 @@ void ImageHeap::RunGarbageCollector() {
 		return true;
 	});
 	m_suspend_draw = m_draw;
+	++m_frame;
 }
 
 void ImageHeap::Drop(Memory& memory) {
