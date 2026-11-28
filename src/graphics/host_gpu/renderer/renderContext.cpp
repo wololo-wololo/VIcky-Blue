@@ -376,7 +376,8 @@ struct WriteWatch {
 		return true;
 	}
 
-	// KYTY_WRITE_WATCH_PAGES=1: one line per first write with the frame, the page and its chain.
+	// KYTY_WRITE_WATCH_PAGES=1: one line per first write with the frame, the page, the written
+	// address and its chain.
 	bool log_pages = [] {
 		const char* value = std::getenv("KYTY_WRITE_WATCH_PAGES");
 		return value != nullptr && value[0] == '1';
@@ -677,9 +678,9 @@ struct WriteWatch {
 				}
 				used += static_cast<size_t>(n);
 			}
-			std::fprintf(stderr, "write watch page: frame %llu page 0x%llx at%s\n",
+			std::fprintf(stderr, "write watch page: frame %llu page 0x%llx addr 0x%llx at%s\n",
 			             static_cast<unsigned long long>(DrawDumpFrameIndex()),
-			             static_cast<unsigned long long>(page), text);
+			             static_cast<unsigned long long>(page), static_cast<unsigned long long>(vaddr), text);
 		}
 		return true;
 	}
