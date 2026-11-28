@@ -544,7 +544,35 @@ struct WriteWatch {
 				}
 			}
 			auto frame = rbp;
-			while (key.size() <= limit && frame >= rsp && (frame & 7u) == 0 &&
+			if (rip < code.begin || rip >= code.end) {
+				// Emulator or system code (an HLE library call) keeps no frame-pointer chain. Take the
+				// first return address into guest code on the stack, then the guest caller's saved
+				// rbp between it and rsp: a value just above that slot whose frame returns into guest
+				// code too. The exact walk continues from there.
+				frame          = 0;
+				const auto  n  = LibKernel::Memory::ReadableHostBytes(rsp, 0x10000) / 8;
+				const auto* st = reinterpret_cast<const uint64_t*>(rsp);
+				for (uint64_t i = 0; i < n; i++) {
+					if (st[i] < code.begin || st[i] >= code.end || !IsReturnAddress(st[i])) {
+						continue;
+					}
+					key.push_back(st[i]);
+					const auto slot = rsp + i * 8;
+					for (uint64_t j = 0; j < i; j++) {
+						const auto v = st[j];
+						if (v > slot && v - slot < 0x10000 && (v & 7u) == 0 &&
+						    LibKernel::Memory::ReadableHostBytes(v, 16) == 16) {
+							const auto ret = reinterpret_cast<const uint64_t*>(v)[1];
+							if (ret >= code.begin && ret < code.end && IsReturnAddress(ret)) {
+								frame = v;
+								break;
+							}
+						}
+					}
+					break;
+				}
+			}
+			while (frame != 0 && key.size() <= limit && frame >= rsp && (frame & 7u) == 0 &&
 			       LibKernel::Memory::ReadableHostBytes(frame, 16) == 16) {
 				const auto* slots = reinterpret_cast<const uint64_t*>(frame);
 				const auto  ret   = slots[1];
