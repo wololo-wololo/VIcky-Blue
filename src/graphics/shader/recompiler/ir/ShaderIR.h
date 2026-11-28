@@ -759,6 +759,12 @@ struct ResourcePlan {
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// GPU-selected buffer tables with at least this many candidates take runtime layouts; 0
+	// uses the global threshold. A program whose small tables keep respecializing lowers it.
+	uint32_t                            runtime_layout_min_candidates = 0;
+	// Most candidate slots each runtime-layout table of this plan padded to: tables never pad to
+	// fewer, so one whose candidates shrink back keeps its module.
+	mutable std::vector<uint32_t>       runtime_layout_slots; // By buffer resource index.
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.

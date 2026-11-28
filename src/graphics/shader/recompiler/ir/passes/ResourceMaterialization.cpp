@@ -22,6 +22,54 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 namespace {
 uint32_t g_runtime_layout_min_candidates = 256u;
+
+// A runtime-layout table's candidate slots: a power of two of at least RuntimeLayoutMinSlots and
+// never fewer than the plan padded to before, so its descriptor array, and the module, stay the
+// same while candidates come and go.
+uint32_t RuntimeLayoutSlots(const ResourcePlan& plan, uint32_t root, uint32_t candidates) {
+	if (plan.runtime_layout_slots.size() <= root) plan.runtime_layout_slots.resize(root + 1u, 0u);
+	auto& slots = plan.runtime_layout_slots[root];
+	slots = std::max(slots, std::bit_ceil(std::max(candidates, RuntimeLayoutMinSlots)));
+	return slots;
+}
+
+// Every indirect buffer, image, or sampler root gets a fixed directory word in flattened_srt
+// right after the SRT reads. That word holds the runtime offset of its mapping table, so growing
+// or shrinking an earlier table never shifts another resource's indirect_mapping_offset.
+template <class P>
+uint32_t IndirectMappingDirectorySize(const P& program) {
+	uint32_t count = 0;
+	const auto has_indirect = [&](uint32_t source) {
+		return source < program.descriptor_sources.size() &&
+		       program.descriptor_sources[source].indirect_descriptor.has_value();
+	};
+	for (const auto& b: program.info.buffers) count += has_indirect(b.source);
+	for (const auto& img: program.info.images) count += has_indirect(img.source);
+	for (const auto& s: program.info.samplers) count += has_indirect(s.source);
+	return count;
+}
+
+template <class P>
+uint32_t IndirectMappingDirectorySlot(const P& program, uint32_t kind, uint32_t index) {
+	uint32_t slot = static_cast<uint32_t>(program.srt_reads.size());
+	const auto has_indirect = [&](uint32_t source) {
+		return source < program.descriptor_sources.size() &&
+		       program.descriptor_sources[source].indirect_descriptor.has_value();
+	};
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		if (kind == 0u && i == index) return slot;
+		slot += has_indirect(program.info.buffers[i].source);
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		if (kind == 1u && i == index) return slot;
+		slot += has_indirect(program.info.images[i].source);
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (kind == 2u && i == index) return slot;
+		slot += has_indirect(program.info.samplers[i].source);
+	}
+	return slot;
+}
 } // namespace
 
 uint32_t RuntimeLayoutMinCandidates() {
@@ -30,6 +78,11 @@ uint32_t RuntimeLayoutMinCandidates() {
 
 void SetRuntimeLayoutMinCandidatesForTests(uint32_t candidates) {
 	g_runtime_layout_min_candidates = candidates;
+}
+
+uint32_t RuntimeLayoutMinCandidates(const ResourcePlan& plan) {
+	return plan.runtime_layout_min_candidates != 0u ? plan.runtime_layout_min_candidates
+	                                                : g_runtime_layout_min_candidates;
 }
 
 namespace {
@@ -812,9 +865,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				                                view)) {
 					snapshot.specialization_reads.emplace_back(table_base, table_size);
 					if (view.kinds.empty()) return true;
+					const auto dir_slot = IndirectMappingDirectorySlot(program, 1u, resource_index);
+					snapshot.flattened_srt[dir_slot] = static_cast<uint32_t>(snapshot.flattened_srt.size());
 					auto root = root_resource;
 					root.indirect_root = resource_index;
-					root.indirect_mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+					root.indirect_mapping_offset = dir_slot;
 					root.heap = true;
 					specializations[resource_index] = root;
 					snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
@@ -897,9 +952,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else {
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
+				constexpr uint32_t kind = std::is_same_v<Specialization, ResourceSpecialization::Buffer> ? 0u
+				                        : std::is_same_v<Specialization, ResourceSpecialization::Image> ? 1u
+				                                                                                        : 2u;
+				const auto dir_slot = IndirectMappingDirectorySlot(program, kind, resource_index);
+				snapshot.flattened_srt[dir_slot] = static_cast<uint32_t>(mapping_offset);
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
-				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+				root.indirect_mapping_offset = dir_slot;
 				root.indirect_search_iterations = 0u;
 				if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
 					// A large table keeps its candidates' layouts in runtime words after the
@@ -907,11 +967,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					// candidates to a power of two, so its rows do not specialize the module.
 					const auto children = static_cast<uint32_t>(descriptors.size() - children_begin);
 					if (pointer == nullptr && !program.info.buffers[resource_index].atomic &&
-					    children >= RuntimeLayoutMinCandidates()) {
+					    children >= RuntimeLayoutMinCandidates(program)) {
 						root.runtime_layout = true;
 						auto child = root_resource;
 						child.indirect_root = resource_index;
-						for (auto padded = std::bit_ceil(children); padded > children; --padded) {
+						for (auto padded = RuntimeLayoutSlots(program, resource_index, children); padded > children; --padded) {
 							descriptors.push_back({.dword_count = dword_count});
 							specializations.push_back(child);
 						}
@@ -1004,18 +1064,23 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		constexpr uint32_t kind = std::is_same_v<Specialization, ResourceSpecialization::Buffer> ? 0u
+		                        : std::is_same_v<Specialization, ResourceSpecialization::Image> ? 1u
+		                                                                                        : 2u;
+		const auto dir_slot = IndirectMappingDirectorySlot(program, kind, resource_index);
+		snapshot.flattened_srt[dir_slot] = static_cast<uint32_t>(mapping_offset);
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
-		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+		root.indirect_mapping_offset    = dir_slot;
 		root.indirect_search_iterations = std::bit_width(key_count);
 		if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Buffer>) {
 			// As for plain tables; the runtime words follow the key/ordinal pairs.
 			const auto children = static_cast<uint32_t>(descriptors.size() - children_begin);
-			if (!program.info.buffers[resource_index].atomic && children >= RuntimeLayoutMinCandidates()) {
+			if (!program.info.buffers[resource_index].atomic && children >= RuntimeLayoutMinCandidates(program)) {
 				root.runtime_layout = true;
 				auto child = root_resource;
 				child.indirect_root = resource_index;
-				for (auto padded = std::bit_ceil(children); padded > children; --padded) {
+				for (auto padded = RuntimeLayoutSlots(program, resource_index, children); padded > children; --padded) {
 					descriptors.push_back({.dword_count = dword_count});
 					specializations.push_back(child);
 				}
@@ -1214,8 +1279,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    specialization.images[base_index].indirect_search_iterations == 0u &&
 			    !source->indirect_descriptor->pointer_table) {
 				const auto& indirect = *source->indirect_descriptor;
-				const size_t mapping = specialization.images[base_index].indirect_mapping_offset;
 				const auto& flat = snapshot.flattened_srt;
+				const size_t dir = specialization.images[base_index].indirect_mapping_offset;
+				const size_t mapping = dir < flat.size() ? flat[dir] : flat.size();
 				if (mapping < flat.size() && flat[mapping] <= flat.size() - mapping - 1u) {
 					uint32_t ordinal = 0;
 					for (size_t child = program.info.images.size(); child <= i; ++child)
@@ -1239,15 +1305,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (root.indirect_root != root_index) {
 			continue;
 		}
-		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
-		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
+		const auto dir = root.indirect_mapping_offset;
+		const auto mapping =
+		    dir < snapshot.flattened_srt.size() ? snapshot.flattened_srt[dir] : UINT32_MAX;
+		const auto key_count = mapping < snapshot.flattened_srt.size()
+		                           ? snapshot.flattened_srt[mapping]
 		                           : 0u;
 		// A heap maps its slot count and slot address; tables map each key.
 		size_t mapping_words = 3u;
 		if (!root.heap)
 			mapping_words = 1u + size_t {key_count} * (root.indirect_search_iterations == 0u ? 1u : 2u);
-		if (key_count == 0u ||
-		    root.indirect_mapping_offset + mapping_words > snapshot.flattened_srt.size()) {
+		if (key_count == 0u || mapping >= snapshot.flattened_srt.size() ||
+		    mapping + mapping_words > snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
@@ -1784,6 +1853,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
+	snapshot.flattened_srt.resize(
+	    snapshot.flattened_srt.size() + IndirectMappingDirectorySize(program), 0u);
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	std::array<uint32_t, 3> workgroup_counts {};
@@ -1905,7 +1976,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			for (const auto i: ordinals) classes.push_back(class_of(specialization.buffers[i]));
 			std::ranges::sort(classes);
 			classes.erase(std::unique(classes.begin(), classes.end()), classes.end());
-			const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+			const auto dir = specialization.buffers[root].indirect_mapping_offset;
+			const auto mapping = snapshot.flattened_srt[dir];
 			const auto pairs = specialization.buffers[root].indirect_search_iterations != 0u;
 			const auto words = mapping + 1u + snapshot.flattened_srt[mapping] * (pairs ? 2u : 1u);
 			if (words + ordinals.size() > snapshot.flattened_srt.size())
@@ -2054,6 +2126,32 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 		resource.cube          = ((kind - 1u) & 1u) != 0u;
 	}
 	return resource;
+}
+
+void CanonicalizeIndirectMappingOffsets(const Program&          program,
+                                        ResourceSpecialization& specialization) {
+	const auto orig_buffers = std::min(program.info.buffers.size(), specialization.buffers.size());
+	for (uint32_t i = 0; i < orig_buffers; ++i) {
+		if (specialization.buffers[i].indirect_root == i) {
+			specialization.buffers[i].indirect_mapping_offset =
+			    IndirectMappingDirectorySlot(program, 0u, i);
+		}
+	}
+	const auto orig_images = std::min(program.info.images.size(), specialization.images.size());
+	for (uint32_t i = 0; i < specialization.images.size(); ++i) {
+		const auto root = specialization.images[i].indirect_root;
+		if (root < orig_images && (i == root || specialization.images[i].heap)) {
+			specialization.images[i].indirect_mapping_offset =
+			    IndirectMappingDirectorySlot(program, 1u, root);
+		}
+	}
+	const auto orig_samplers = std::min(program.info.samplers.size(), specialization.samplers.size());
+	for (uint32_t i = 0; i < orig_samplers; ++i) {
+		if (specialization.samplers[i].indirect_root == i) {
+			specialization.samplers[i].indirect_mapping_offset =
+			    IndirectMappingDirectorySlot(program, 2u, i);
+		}
+	}
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -2379,13 +2477,13 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 template <class S, class P> void IoPlan(S& io, P& plan) {
 	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	       srt_plan_complete, resource_tracking_complete, runtime_layout_min_candidates, runtime_layout_slots, info, uniform_fill,
 	       // Derived on load.
 	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
-	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);
+	      srt_plan_complete, resource_tracking_complete, runtime_layout_min_candidates, runtime_layout_slots, info, uniform_fill);
 }
 
 } // namespace
@@ -2394,6 +2492,18 @@ std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan) {
 	Writer writer;
 	IoPlan(writer, plan);
 	return std::move(writer.bytes);
+}
+
+void MergeRuntimeLayoutState(ResourcePlan& plan, const ResourcePlan& other) {
+	if (other.runtime_layout_min_candidates != 0u &&
+	    (plan.runtime_layout_min_candidates == 0u ||
+	     other.runtime_layout_min_candidates < plan.runtime_layout_min_candidates)) {
+		plan.runtime_layout_min_candidates = other.runtime_layout_min_candidates;
+	}
+	auto& slots = plan.runtime_layout_slots;
+	if (slots.size() < other.runtime_layout_slots.size()) slots.resize(other.runtime_layout_slots.size(), 0u);
+	for (size_t i = 0; i < other.runtime_layout_slots.size(); ++i)
+		slots[i] = std::max(slots[i], other.runtime_layout_slots[i]);
 }
 
 bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {

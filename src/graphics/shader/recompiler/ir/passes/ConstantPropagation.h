@@ -4,6 +4,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size = 64);
+struct Program;
+
+void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size = 64,
+                             bool aggressive = true);
+bool LowerDivergentExecRegions(Program& program, bool single_lane = true);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

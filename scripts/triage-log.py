@@ -77,7 +77,8 @@ def parse(path):
                 in_build = True
                 continue
             if in_build:
-                build = scrub(line)
+                # Build lines can include the title name in the emulator's window metadata.
+                build = "<build details scrubbed>"
                 in_build = False
                 continue
             if line.startswith("--- Error ---"):

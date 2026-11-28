@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOutliner.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -6093,7 +6094,8 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
     return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
   });
-  Check(root != buffers.end() && snapshot.flattened_srt[root->indirect_mapping_offset] == 2u &&
+  Check(root != buffers.end() &&
+            snapshot.flattened_srt[snapshot.flattened_srt[root->indirect_mapping_offset]] == 2u &&
             buffers.size() == plan.info.buffers.size() + 1u,
         "bounded material range did not select exactly its two writable buffers");
   const auto root_index = static_cast<size_t>(root - buffers.begin());
@@ -9745,6 +9747,294 @@ void TestRepeatedBitcastPropagation() {
   }
 }
 
+void TestSelectInnerImpliesOuterAbsorption() {
+  using namespace ShaderRecompiler::IR;
+  {
+    Block block;
+    IREmitter ir(&block);
+    const auto outer_c = ir.Emit(ValueOpcode::INotEqual32,
+                                 {ir.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto extra_c = ir.Emit(ValueOpcode::INotEqual32,
+                                 {ir.GetUserData(static_cast<ScalarReg>(1)), Value(0u)});
+    const auto inner_c = ir.Emit(ValueOpcode::LogicalAnd, {outer_c, extra_c});
+    const auto t = ir.GetUserData(static_cast<ScalarReg>(2));
+    const auto c = ir.GetUserData(static_cast<ScalarReg>(3));
+    const auto inner = ir.Emit(ValueOpcode::SelectU32, {inner_c, t, c});
+    const auto outer = ir.Emit(ValueOpcode::SelectU32, {outer_c, inner, c});
+    ConstantPropagationPass({&block}, 64u, true);
+    Check(outer.Resolve() == inner.Resolve(),
+          "Select(outer, Select(outer && x, t, c), c) did not collapse to inner Select");
+  }
+  {
+    Block block;
+    IREmitter ir(&block);
+    const auto outer_c = ir.Emit(ValueOpcode::INotEqual32,
+                                 {ir.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto extra_c = ir.Emit(ValueOpcode::INotEqual32,
+                                 {ir.GetUserData(static_cast<ScalarReg>(1)), Value(0u)});
+    const auto inner_c = ir.Emit(ValueOpcode::LogicalOr, {outer_c, extra_c});
+    const auto t = ir.GetUserData(static_cast<ScalarReg>(2));
+    const auto f = ir.GetUserData(static_cast<ScalarReg>(3));
+    const auto inner = ir.Emit(ValueOpcode::SelectU32, {inner_c, t, f});
+    const auto outer = ir.Emit(ValueOpcode::SelectU32, {outer_c, t, inner});
+    ConstantPropagationPass({&block}, 64u, true);
+    Check(outer.Resolve() == inner.Resolve(),
+          "Select(outer, t, Select(outer || x, t, f)) did not collapse to inner Select");
+  }
+}
+
+void TestPromoteFloatSelectAndPhi() {
+  using namespace ShaderRecompiler::IR;
+  Program program;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto* entry = program.block_storage[0].get();
+  auto* loop  = program.block_storage[1].get();
+  auto* exit_b = program.block_storage[2].get();
+  entry->AddBranch(loop);
+  loop->AddBranch(exit_b);
+  program.blocks = {entry, loop, exit_b};
+
+  IREmitter e_entry(entry);
+  const auto cond = e_entry.Emit(ValueOpcode::INotEqual32,
+                                 {e_entry.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+  const auto init_f = e_entry.Emit(ValueOpcode::ConvertF32U32,
+                                   {e_entry.GetUserData(static_cast<ScalarReg>(1))});
+  const auto init_u = e_entry.Emit(ValueOpcode::BitCastU32F32, {init_f});
+
+  auto& phi = loop->AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  IREmitter e_loop(loop);
+  const auto cur_f = e_loop.Emit(ValueOpcode::BitCastF32U32, {Value(&phi)});
+  const auto sum_f = e_loop.Emit(ValueOpcode::FPAdd32, {cur_f, Value::F32(1.0f)});
+  const auto sum_u = e_loop.Emit(ValueOpcode::BitCastU32F32, {sum_f});
+  const auto sel_u = e_loop.Emit(ValueOpcode::SelectU32, {cond, sum_u, Value(&phi)});
+  phi.AddPhiOperand(entry, init_u);
+  phi.AddPhiOperand(loop, sel_u);
+  loop->AddBranch(loop);
+
+  IREmitter e_exit(exit_b);
+  const auto out_f = e_exit.Emit(ValueOpcode::BitCastF32U32, {sel_u});
+  const auto mul_f = e_exit.Emit(ValueOpcode::FPMul32, {out_f, Value::F32(2.0f)});
+  const auto mul_u = e_exit.Emit(ValueOpcode::BitCastU32F32, {mul_f});
+  const auto buf = e_exit.Emit(ValueOpcode::GetBufferResource,
+                               {Value(0u), Value(0u), Value(0u), Value(0u)});
+  e_exit.Emit(ValueOpcode::StoreBufferU32,
+              {buf, Value(0u), Value(0u), Value(0u), mul_u, Value(true)});
+
+  ConstantPropagationPass(program.blocks, 64u, true);
+  EliminateDeadCode(program.blocks);
+
+  size_t f32_phis = 0, u32_phis = 0, select_f32s = 0, select_u32s = 0, bitcasts_before_store = 0;
+  for (const auto* blk : program.blocks) {
+    for (const auto& inst : *blk) {
+      if (inst.GetOpcode() == ValueOpcode::Phi) {
+        if (inst.GetType() == Type::F32) f32_phis++;
+        else u32_phis++;
+      } else if (inst.GetOpcode() == ValueOpcode::SelectF32) {
+        select_f32s++;
+      } else if (inst.GetOpcode() == ValueOpcode::SelectU32) {
+        select_u32s++;
+      } else if (inst.GetOpcode() == ValueOpcode::BitCastF32U32 ||
+                 (inst.GetOpcode() == ValueOpcode::BitCastU32F32 &&
+                  inst.Arg(0).Resolve().Instruction() != mul_f.Instruction())) {
+        bitcasts_before_store++;
+      }
+    }
+  }
+  Check(f32_phis == 1 && u32_phis == 0 && select_f32s == 1 && select_u32s == 0 &&
+            bitcasts_before_store == 0,
+        "float Select/Phi promotion did not convert U32 Phi+Select to F32 and eliminate intermediate BitCasts");
+}
+
+void TestLowerDivergentExecRegionBasic() {
+  using namespace ShaderRecompiler::IR;
+  Program program;
+  program.wave_size = 32u;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto* H = program.block_storage[0].get();
+  auto* R = program.block_storage[1].get();
+  auto* M = program.block_storage[2].get();
+  H->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  H->terminator.true_block = R;
+  H->terminator.false_block = M;
+  H->terminator.merge_block = M;
+  R->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+  R->terminator.true_block = M;
+  H->AddBranch(R);
+  H->AddBranch(M);
+  R->AddBranch(M);
+  program.blocks = {H, R, M};
+
+  IREmitter e_h(H);
+  const auto active = e_h.Emit(ValueOpcode::INotEqual32,
+                               {e_h.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+  const auto old_v = e_h.GetUserData(static_cast<ScalarReg>(1));
+  const auto buf = e_h.Emit(ValueOpcode::GetBufferResource,
+                            {Value(0u), Value(0u), Value(0u), Value(0u)});
+  const auto cond_ref = e_h.Emit(ValueOpcode::ConditionRef, {active},
+                                 static_cast<uint64_t>(ShaderRecompiler::CFG::BranchCondition::ExecNonZero));
+  H->condition = cond_ref;
+  e_h.Emit(ValueOpcode::Reference, {cond_ref});
+
+  IREmitter e_r(R);
+  const auto loaded = e_r.Emit(ValueOpcode::LoadBufferU32,
+                               {buf, Value(0u), Value(0u), Value(0u), active});
+  const auto selected = e_r.Emit(ValueOpcode::SelectU32, {active, loaded, old_v});
+
+  auto& phi = M->AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  phi.AddPhiOperand(H, old_v);
+  phi.AddPhiOperand(R, selected);
+  IREmitter e_m(M);
+  e_m.Emit(ValueOpcode::StoreBufferU32,
+           {buf, Value(4u), Value(0u), Value(0u), Value(&phi), Value(true)});
+
+  Check(LowerDivergentExecRegions(program),
+        "wave32 EXEC region without cross-lane or SGPR escape should lower");
+  ConstantPropagationPass(program.blocks, program.wave_size);
+  RemoveIdentities(program);
+  EliminateDeadCode(program.blocks);
+
+  Check(cond_ref.Resolve().Instruction()->Flags<ShaderRecompiler::CFG::BranchCondition>() ==
+            ShaderRecompiler::CFG::BranchCondition::ScalarInstruction,
+        "lowered ConditionRef did not become ScalarInstruction");
+  Check(loaded.Resolve().Instruction()->Arg(4).Resolve() == Value(true),
+        "LoadBufferU32 active predicate was not replaced with true inside lowered region");
+  size_t selects = 0;
+  for (const auto* blk : program.blocks) {
+    for (const auto& inst : *blk) {
+      if (inst.GetOpcode() == ValueOpcode::SelectU32) selects++;
+    }
+  }
+  Check(selects == 0, "SelectU32 inside lowered EXEC region was not eliminated");
+}
+
+void TestLowerDivergentExecRegionRejectsSubgroupAndEscapingSgpr() {
+  using namespace ShaderRecompiler::IR;
+  const auto build_and_run = [](bool wave64, bool add_barrier, bool unguarded_phi) {
+    Program program;
+    program.wave_size = wave64 ? 64u : 32u;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto* H = program.block_storage[0].get();
+    auto* R = program.block_storage[1].get();
+    auto* M = program.block_storage[2].get();
+    H->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    H->terminator.true_block = R;
+    H->terminator.false_block = M;
+    H->terminator.merge_block = M;
+    R->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    R->terminator.true_block = M;
+    H->AddBranch(R);
+    H->AddBranch(M);
+    R->AddBranch(M);
+    program.blocks = {H, R, M};
+
+    IREmitter e_h(H);
+    const auto active = e_h.Emit(ValueOpcode::INotEqual32,
+                                 {e_h.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto old_v = e_h.GetUserData(static_cast<ScalarReg>(1));
+    const auto buf = e_h.Emit(ValueOpcode::GetBufferResource,
+                              {Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto cond_ref = e_h.Emit(ValueOpcode::ConditionRef, {active},
+                                   static_cast<uint64_t>(ShaderRecompiler::CFG::BranchCondition::ExecNonZero));
+    H->condition = cond_ref;
+    e_h.Emit(ValueOpcode::Reference, {cond_ref});
+
+    IREmitter e_r(R);
+    if (add_barrier) e_r.Emit(ValueOpcode::Barrier);
+    const auto loaded = e_r.Emit(ValueOpcode::LoadBufferU32,
+                                 {buf, Value(0u), Value(0u), Value(0u), active});
+    const auto r_val = unguarded_phi ? loaded
+                                     : e_r.Emit(ValueOpcode::SelectU32, {active, loaded, old_v});
+
+    auto& phi = M->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(H, old_v);
+    phi.AddPhiOperand(R, r_val);
+    IREmitter e_m(M);
+    e_m.Emit(ValueOpcode::StoreBufferU32,
+             {buf, Value(4u), Value(0u), Value(0u), Value(&phi), Value(true)});
+    return LowerDivergentExecRegions(program, !wave64);
+  };
+  Check(build_and_run(false, false, false), "baseline wave32 EXEC region should lower");
+  Check(!build_and_run(true, false, false), "emulated wave64 EXEC region must not lower");
+  Check(!build_and_run(false, true, false), "EXEC region containing Barrier must not lower");
+  Check(!build_and_run(false, false, true), "EXEC region with unguarded Phi arm must not lower");
+
+  // Pixel shaders run 1:1 on host lanes even at wave_size=64, so explicit-LOD regions lower while
+  // implicit-LOD samples in Pixel shaders stay rejected.
+  for (const bool implicit_lod : {false, true}) {
+    Program program;
+    program.stage = ShaderType::Pixel;
+    program.wave_size = 64u;
+    program.memory_info.resize(1);
+    program.memory_info[0].kind = ShaderRecompiler::IR::ResourceKind::Image;
+    program.memory_info[0].image_sample_flags =
+        implicit_lod ? 0u : ShaderRecompiler::Decoder::ImageSampleFlagLod;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto* H = program.block_storage[0].get();
+    auto* R = program.block_storage[1].get();
+    auto* M = program.block_storage[2].get();
+    H->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    H->terminator.true_block = R;
+    H->terminator.false_block = M;
+    H->terminator.merge_block = M;
+    R->terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    R->terminator.true_block = M;
+    H->AddBranch(R);
+    H->AddBranch(M);
+    R->AddBranch(M);
+    program.blocks = {H, R, M};
+
+    IREmitter e_h(H);
+    const auto active = e_h.Emit(ValueOpcode::INotEqual32,
+                                 {e_h.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto old_v = e_h.GetUserData(static_cast<ScalarReg>(1));
+    const auto img = e_h.Emit(ValueOpcode::GetImageResource,
+                              {Value(0u), Value(0u), Value(0u), Value(0u),
+                               Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto samp = e_h.Emit(ValueOpcode::GetSamplerResource,
+                               {Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto addr = e_h.Emit(ValueOpcode::MakeImageAddress,
+                               {Value(0u), Value(0u), Value(0u), Value(0u),
+                                Value(0u), Value(0u), Value(0u), Value(0u),
+                                Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto cond_ref = e_h.Emit(ValueOpcode::ConditionRef, {active},
+                                   static_cast<uint64_t>(ShaderRecompiler::CFG::BranchCondition::ExecNonZero));
+    H->condition = cond_ref;
+    e_h.Emit(ValueOpcode::Reference, {cond_ref});
+
+    IREmitter e_r(R);
+    const auto sampled = e_r.Emit(ValueOpcode::ImageSampleRaw,
+                                  {img, samp, addr, active}, 0u);
+    const auto comp = e_r.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
+    const auto selected = e_r.Emit(ValueOpcode::SelectU32, {active, comp, old_v});
+
+    auto& phi = M->AppendNewInst(ValueOpcode::Phi);
+    phi.SetFlags(Type::U32);
+    phi.AddPhiOperand(H, old_v);
+    phi.AddPhiOperand(R, selected);
+    const auto buf = e_h.Emit(ValueOpcode::GetBufferResource,
+                              {Value(0u), Value(0u), Value(0u), Value(0u)});
+    IREmitter e_m(M);
+    e_m.Emit(ValueOpcode::StoreBufferU32,
+             {buf, Value(4u), Value(0u), Value(0u), Value(&phi), Value(true)});
+
+    const bool lowered = LowerDivergentExecRegions(program, true);
+    Check(lowered == !implicit_lod,
+          implicit_lod ? "implicit-LOD sample in Pixel shader must not lower"
+                       : "explicit-LOD wave64 Pixel shader EXEC region should lower");
+  }
+}
+
 void TestMaskedShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
   for (const uint32_t count : {0u, 1u, 8u, 31u, 32u, 33u, 40u, 63u, 64u, UINT32_MAX}) {
@@ -9857,6 +10147,91 @@ void TestU64RegisterPairRoundTrip() {
             mixed.Resolve().Instruction()->GetOpcode() ==
                 ValueOpcode::CompositeConstructU64,
         "modified SGPR pair incorrectly reused an unrelated native U64 value");
+}
+
+void TestGuardedSelectAndBoundedComparePropagation() {
+  using namespace ShaderRecompiler::IR;
+  {
+    Program program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto* entry = program.blocks.emplace_back(program.block_storage.back().get());
+    IREmitter ir(entry);
+    const auto c0 = ir.Emit(ValueOpcode::INotEqual32,
+                            {ir.Emit(ValueOpcode::LaneId), Value(0u)});
+    const auto c1 = ir.Emit(ValueOpcode::INotEqual32,
+                            {ir.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto exec = ir.Emit(ValueOpcode::LogicalAnd, {c0, c1});
+    const auto a = ir.Emit(ValueOpcode::ConvertF32U32,
+                           {ir.GetUserData(static_cast<ScalarReg>(1))});
+    const auto old_u = ir.GetUserData(static_cast<ScalarReg>(2));
+    const auto init_u = ir.Emit(
+        ValueOpcode::SelectU32,
+        {exec, ir.Emit(ValueOpcode::BitCastU32F32, {a}), old_u});
+    const auto f1 = ir.Emit(ValueOpcode::BitCastF32U32, {init_u});
+    const auto f2 = ir.Emit(ValueOpcode::FPAdd32, {f1, Value::F32(1.0f)});
+    const auto next_u = ir.Emit(
+        ValueOpcode::SelectU32,
+        {exec, ir.Emit(ValueOpcode::BitCastU32F32, {f2}), init_u});
+    const auto buf = ir.Emit(ValueOpcode::GetBufferResource,
+                             {Value(0u), Value(0u), Value(0u), Value(0u)});
+    auto& store = entry->AppendNewInst(
+        ValueOpcode::StoreBufferU32,
+        {buf, Value(0u), Value(0u), Value(0u), next_u, exec});
+    ConstantPropagationPass(program.blocks);
+    EliminateDeadCode(program.blocks);
+    Check(store.Arg(4).Resolve().Instruction() != nullptr &&
+              store.Arg(4).Resolve().Instruction()->GetOpcode() ==
+                  ValueOpcode::BitCastU32F32,
+          "guarded select chain did not collapse to direct BitCastU32F32 store data");
+    for (const auto& inst : *entry) {
+      Check(inst.GetOpcode() != ValueOpcode::SelectU32,
+            "redundant EXEC-guarded SelectU32 survived constant propagation and DCE");
+    }
+  }
+  {
+    Block block;
+    IREmitter ir(&block);
+    const auto cond = ir.Emit(ValueOpcode::INotEqual32,
+                              {ir.GetUserData(static_cast<ScalarReg>(0)), Value(0u)});
+    const auto af = ir.Emit(ValueOpcode::ConvertF32U32,
+                            {ir.GetUserData(static_cast<ScalarReg>(1))});
+    const auto sel = ir.Emit(
+        ValueOpcode::SelectU32,
+        {cond, ir.Emit(ValueOpcode::BitCastU32F32, {af}), Value(0u)});
+    const auto out = ir.Emit(ValueOpcode::BitCastF32U32, {sel});
+    const auto keep = ir.Emit(ValueOpcode::FPAdd32, {out, Value::F32(2.0f)});
+    const auto pred = ir.Emit(ValueOpcode::FPOrdEqual32, {keep, Value::F32(2.0f)});
+    const auto buf = ir.Emit(ValueOpcode::GetBufferResource,
+                             {Value(0u), Value(0u), Value(0u), Value(0u)});
+    block.AppendNewInst(ValueOpcode::StoreBufferU32,
+                        {buf, Value(0u), Value(0u), Value(0u), Value(1u), pred});
+    ConstantPropagationPass({&block});
+    EliminateDeadCode({&block});
+    const auto sunk = keep.Resolve().Instruction()->Arg(0).Resolve();
+    Check(sunk.Instruction() != nullptr &&
+              sunk.Instruction()->GetOpcode() == ValueOpcode::SelectF32,
+          "BitCastF32U32(SelectU32) did not sink into SelectF32");
+    for (const auto& inst : block) {
+      Check(inst.GetOpcode() != ValueOpcode::BitCastU32F32 &&
+                inst.GetOpcode() != ValueOpcode::BitCastF32U32,
+            "sunk BitCast around Select left redundant BitCast instruction");
+    }
+  }
+  {
+    Block block;
+    IREmitter ir(&block);
+    const auto raw = ir.GetUserData(static_cast<ScalarReg>(0));
+    const auto masked = ir.Emit(ValueOpcode::BitwiseAnd32, {raw, Value(7u)});
+    const auto extracted = ir.Emit(ValueOpcode::BitFieldUExtract, {raw, Value(4u), Value(3u)});
+    const auto lt_impossible = ir.Emit(ValueOpcode::ULessThan32, {Value(7u), masked});
+    const auto lt_possible = ir.Emit(ValueOpcode::ULessThan32, {Value(6u), masked});
+    const auto le_guaranteed = ir.Emit(ValueOpcode::ULessThanEqual32, {extracted, Value(7u)});
+    ConstantPropagationPass({&block});
+    Check(lt_impossible.Resolve() == Value(false) &&
+              le_guaranteed.Resolve() == Value(true) &&
+              !lt_possible.Resolve().IsImmediate(),
+          "bounded U32 range comparison did not fold accurately");
+  }
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -11760,7 +12135,7 @@ void TestBoundedScalarMaterialImageKeys() {
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
       const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
       const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
-      const auto offset = specialization.images[root].indirect_mapping_offset;
+      const auto offset = snapshot.flattened_srt[specialization.images[root].indirect_mapping_offset];
       Check(snapshot.flattened_srt[offset] == 2u &&
                 snapshot.flattened_srt[offset + 1u] == first &&
                 snapshot.flattened_srt[offset + 3u] == first + 15u,
@@ -11797,7 +12172,7 @@ void TestBoundedScalarMaterialImageKeys() {
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &selector =
         *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
-    const auto offset = specialization.images[root].indirect_mapping_offset;
+    const auto offset = snapshot.flattened_srt[specialization.images[root].indirect_mapping_offset];
     Check(snapshot.flattened_srt[offset + 1u] == (selector.offset == 0x94u ? 0u : 5567u),
           "scalar material key past its V# did not read as zero");
   }
@@ -13707,9 +14082,14 @@ int main() {
   TestLaneMaskProjection();
   TestLateConstantPropagation();
   TestRepeatedBitcastPropagation();
+  TestSelectInnerImpliesOuterAbsorption();
+  TestPromoteFloatSelectAndPhi();
+  TestLowerDivergentExecRegionBasic();
+  TestLowerDivergentExecRegionRejectsSubgroupAndEscapingSgpr();
   TestMaskedShiftConstantPropagation();
   TestU64ShiftConstantPropagation();
   TestU64RegisterPairRoundTrip();
+  TestGuardedSelectAndBoundedComparePropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
 #endif
@@ -13766,6 +14146,76 @@ int main() {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+
+  {
+    Libs::Graphics::ShaderRecompiler::Spirv::Builder b;
+    b.RequireCapability(spv::CapabilityShader);
+    b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+    const auto void_t = b.Type(spv::OpTypeVoid);
+    const auto bool_t = b.Type(spv::OpTypeBool);
+    const auto u32_t  = b.Type(spv::OpTypeInt, 32u, 0u);
+    const auto fn_t   = b.Type(spv::OpTypeFunction, void_t);
+    const auto c0     = b.Constant(spv::OpConstant, u32_t, 0u);
+    const auto c1     = b.Constant(spv::OpConstant, u32_t, 1u);
+    const auto c2     = b.Constant(spv::OpConstant, u32_t, 2u);
+    const auto c3     = b.Constant(spv::OpConstant, u32_t, 3u);
+    const auto main_f = b.AllocateId();
+    b.AddEntryPoint(spv::ExecutionModelGLCompute, main_f, "main", {});
+    b.AddExecutionMode(main_f, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
+    b.AddFunction(spv::OpFunction, void_t, main_f, spv::FunctionControlMaskNone, fn_t);
+    b.AddFunction(spv::OpLabel, b.AllocateId());
+
+    auto emit_sese = [&](uint32_t seed) {
+      const auto cond = b.AllocateId();
+      b.AddFunction(spv::OpINotEqual, bool_t, cond, seed, c0);
+      const auto then_l  = b.AllocateId();
+      const auto else_l  = b.AllocateId();
+      const auto merge_l = b.AllocateId();
+      b.AddFunction(spv::OpSelectionMerge, merge_l, spv::SelectionControlMaskNone);
+      b.AddFunction(spv::OpBranchConditional, cond, then_l, else_l);
+      b.AddFunction(spv::OpLabel, then_l);
+      uint32_t tv = seed;
+      for (int k = 0; k < 20; ++k) {
+        const auto nxt = b.AllocateId();
+        b.AddFunction(spv::OpIAdd, u32_t, nxt, tv, c1);
+        tv = nxt;
+      }
+      b.AddFunction(spv::OpBranch, merge_l);
+      b.AddFunction(spv::OpLabel, else_l);
+      uint32_t ev = seed;
+      for (int k = 0; k < 20; ++k) {
+        const auto nxt = b.AllocateId();
+        b.AddFunction(spv::OpBitwiseXor, u32_t, nxt, ev, c2);
+        ev = nxt;
+      }
+      b.AddFunction(spv::OpBranch, merge_l);
+      b.AddFunction(spv::OpLabel, merge_l);
+      const auto phi = b.AllocateId();
+      b.AddFunction(spv::OpPhi, u32_t, phi, tv, then_l, ev, else_l);
+      return phi;
+    };
+
+    const auto s1 = b.AllocateId();
+    b.AddFunction(spv::OpIAdd, u32_t, s1, c1, c2);
+    const auto s2 = b.AllocateId();
+    b.AddFunction(spv::OpIAdd, u32_t, s2, c2, c3);
+    const auto r1  = emit_sese(s1);
+    const auto r2  = emit_sese(s2);
+    const auto sum = b.AllocateId();
+    b.AddFunction(spv::OpIAdd, u32_t, sum, r1, r2);
+    b.AddFunction(spv::OpReturn);
+    b.AddFunction(spv::OpFunctionEnd);
+
+    auto words = b.Build();
+    CheckSpirvBinaryValidates(words);
+    const size_t before_words = words.size();
+    Libs::Graphics::ShaderRecompiler::Spirv::OutlineRepeatedRegions(words, 0u);
+    CheckSpirvBinaryValidates(words);
+    Check(words.size() < before_words, "SPIR-V outliner should shrink repeated SESE regions");
+    const auto text = DisassembleSpirvBinary(words);
+    Check(text.find("DontInline") != std::string::npos,
+          "SPIR-V outliner should mark outlined function DontInline");
+  }
 
   return 0;
 }

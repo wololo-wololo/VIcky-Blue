@@ -119,8 +119,59 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
 		return result;
 	}
+	if (const auto func = state.minmax_f32_functions[max_value ? 1u : 0u]; func != 0u) {
+		return EmitNative<spv::OpFunctionCall, IR::Type::F32>(state, func, lhs, rhs);
+	}
 	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
+}
+
+void DefineMinMaxF32Functions(EmitterState& state) {
+	if (state.profile.native_float_min_max || state.profile.relaxed_float) {
+		return;
+	}
+	bool needed[2] = {};
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::FPMin32:
+				case IR::ValueOpcode::FPMinTri32: needed[0] = true; break;
+				case IR::ValueOpcode::FPMax32:
+				case IR::ValueOpcode::FPMaxTri32: needed[1] = true; break;
+				case IR::ValueOpcode::FPMedTri32:
+					needed[0] = true;
+					needed[1] = true;
+					break;
+				default: break;
+			}
+			if (needed[0] && needed[1]) break;
+		}
+		if (needed[0] && needed[1]) break;
+	}
+	if (!needed[0] && !needed[1]) {
+		return;
+	}
+	const auto f32           = TypeF32(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, f32, f32, f32);
+	for (uint32_t max_value = 0; max_value < 2u; ++max_value) {
+		if (!needed[max_value]) continue;
+		const auto func  = state.builder.AllocateId();
+		const auto lhs   = state.builder.AllocateId();
+		const auto rhs   = state.builder.AllocateId();
+		const auto entry = state.builder.AllocateId();
+		state.builder.AddName(func, max_value != 0u ? "amd_max_f32" : "amd_min_f32");
+		state.builder.AddFunction(spv::OpFunction, f32, func, spv::FunctionControlMaskNone,
+		                          function_type);
+		state.builder.AddFunction(spv::OpFunctionParameter, f32, lhs);
+		state.builder.AddFunction(spv::OpFunctionParameter, f32, rhs);
+		EmitLabel(state, entry);
+		const auto result = EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
+		                                  EmitBitcastF32ToU32(state, rhs), max_value != 0u);
+		state.builder.AddFunction(spv::OpReturnValue, result);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.current_label                    = 0;
+		state.minmax_f32_functions[max_value]  = func;
+	}
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
@@ -154,14 +205,26 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	if (state.profile.relaxed_float) {
 		return value;
 	}
+	const uint64_t key = (uint64_t {state.current_label} << 32u) | value;
+	if (state.current_label != 0u) {
+		if (const auto it = state.flushed_f32_denorms.find(key);
+		    it != state.flushed_f32_denorms.end()) {
+			return it->second;
+		}
+	}
 	// x * 0 keeps the sign of a denormal; NaN and infinity fail the ordered compare.
 	const auto magnitude = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), magnitude, GlslStd450(state),
 	                          GLSLstd450FAbs, value);
 	const auto denormal = Binary(state, spv::OpFOrdLessThan, TypeBool(state), magnitude,
 	                             ConstantF32(state, 0x00800000u));
-	return Select(state, TypeF32(state), denormal,
-	              Binary(state, spv::OpFMul, TypeF32(state), value, ConstantF32(state, 0)), value);
+	const auto result =
+	    Select(state, TypeF32(state), denormal,
+	           Binary(state, spv::OpFMul, TypeF32(state), value, ConstantF32(state, 0)), value);
+	if (state.current_label != 0u) {
+		state.flushed_f32_denorms.emplace(key, result);
+	}
+	return result;
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {

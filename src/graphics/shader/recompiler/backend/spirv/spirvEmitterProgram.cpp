@@ -231,14 +231,259 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+bool IsInherentlyUniform(const IR::Inst& inst, const IR::Program& program) {
+	using Op = IR::ValueOpcode;
+	switch (inst.GetOpcode()) {
+		case Op::Ballot:
+		case Op::ReadFirstLane:
+		case Op::SubgroupReduceU32:
+		case Op::ReadConstBuffer:
+		case Op::ReadRealtimeClock:
+		case Op::GetUserData:
+		case Op::GetDispatchThreadExtent:
+		case Op::GetShaderBase:
+		case Op::MeshDrawParameter:
+		case Op::GetSrtResource:
+		case Op::GetBufferResource:
+		case Op::GetBufferResourceIndex:
+		case Op::GetAddressResource:
+		case Op::GetScratchResource:
+		case Op::GetImageResource:
+		case Op::GetSamplerResource: return true;
+		case Op::LoadAddressU8:
+		case Op::LoadAddressU16:
+		case Op::LoadAddressU32:
+			return program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).kind ==
+			       IR::ResourceKind::ScalarAddress;
+		case Op::GetBuiltin: {
+			const auto kind =
+			    static_cast<IR::StageInputKind>(inst.Arg(0).Resolve().U32());
+			return kind == IR::StageInputKind::WorkgroupId ||
+			       kind == IR::StageInputKind::NumWorkgroups ||
+			       kind == IR::StageInputKind::BaseVertex ||
+			       kind == IR::StageInputKind::BaseInstance;
+		}
+		default: return false;
+	}
+}
+
+bool IsUniformPreservingOp(const IR::Inst& inst, const IR::Program& program) {
+	using Op = IR::ValueOpcode;
+	switch (inst.GetOpcode()) {
+		case Op::Phi: return !program.dispatcher_fallback;
+		case Op::Identity:
+		case Op::ConditionRef:
+		case Op::ReadConst:
+		case Op::BitCastU16F16:
+		case Op::BitCastF16U16:
+		case Op::BitCastU32F32:
+		case Op::BitCastF32U32:
+		case Op::BitCastU64F64:
+		case Op::BitCastF64U64:
+		case Op::ConvertU16U32:
+		case Op::ConvertU32U16:
+		case Op::ConvertU8U32:
+		case Op::ConvertU32U8:
+		case Op::ConvertF32F16:
+		case Op::ConvertF16F32:
+		case Op::ConvertS32F32:
+		case Op::ConvertU32F32:
+		case Op::ConvertF32S32:
+		case Op::ConvertF64S32:
+		case Op::ConvertF32F64:
+		case Op::ConvertF64F32:
+		case Op::ConvertF32U32:
+		case Op::ConvertF64U32:
+		case Op::CompositeConstructU64:
+		case Op::CompositeConstructU32x2:
+		case Op::CompositeConstructU32x3:
+		case Op::CompositeConstructF32x2:
+		case Op::CompositeConstructU32x4:
+		case Op::CompositeExtractU64:
+		case Op::CompositeExtractU32x2:
+		case Op::CompositeExtractU32x3:
+		case Op::CompositeExtractU32x4:
+		case Op::PackHalf2x16:
+		case Op::PackSnorm2x16:
+		case Op::PackUnorm2x16:
+		case Op::PackFloat2x16Rtz:
+		case Op::FPAbs32:
+		case Op::FPNeg32:
+		case Op::FPSaturate32:
+		case Op::BitFieldInsert:
+		case Op::BitFieldUExtract:
+		case Op::BitFieldSExtract:
+		case Op::SelectU1:
+		case Op::SelectU32:
+		case Op::SelectF32:
+		case Op::SelectF64:
+		case Op::IAdd32:
+		case Op::IAdd64:
+		case Op::ISub32:
+		case Op::ISub64:
+		case Op::IMul32:
+		case Op::UDiv32:
+		case Op::SMulHi:
+		case Op::UMulHi:
+		case Op::IAbs32:
+		case Op::ShiftLeftLogical32:
+		case Op::ShiftLeftLogical64:
+		case Op::ShiftRightLogical32:
+		case Op::ShiftRightLogical64:
+		case Op::ShiftRightArithmetic32:
+		case Op::ShiftRightArithmetic64:
+		case Op::BitwiseAnd32:
+		case Op::BitwiseAnd64:
+		case Op::BitwiseOr32:
+		case Op::BitwiseXor32:
+		case Op::BitwiseNot32:
+		case Op::BitReverse32:
+		case Op::BitCount32:
+		case Op::FindUMsb32:
+		case Op::FindILsb32:
+		case Op::SMin32:
+		case Op::UMin32:
+		case Op::SMax32:
+		case Op::UMax32:
+		case Op::SMinTri32:
+		case Op::UMinTri32:
+		case Op::SMaxTri32:
+		case Op::UMaxTri32:
+		case Op::SMedTri32:
+		case Op::UMedTri32:
+		case Op::SLessThan32:
+		case Op::SLessThan64:
+		case Op::SLessThanEqual64:
+		case Op::ULessThanEqual64:
+		case Op::UGreaterThanEqual64:
+		case Op::ULessThan32:
+		case Op::ULessThan64:
+		case Op::IEqual32:
+		case Op::IEqual64:
+		case Op::SLessThanEqual32:
+		case Op::ULessThanEqual32:
+		case Op::SGreaterThan32:
+		case Op::UGreaterThan32:
+		case Op::UGreaterThan64:
+		case Op::INotEqual32:
+		case Op::INotEqual64:
+		case Op::SGreaterThanEqual32:
+		case Op::UGreaterThanEqual32:
+		case Op::LogicalOr:
+		case Op::LogicalAnd:
+		case Op::LogicalXor:
+		case Op::LogicalNot:
+		case Op::FPOrdEqual32:
+		case Op::FPOrdEqual64:
+		case Op::FPOrdLessThanEqual64:
+		case Op::FPOrdGreaterThanEqual64:
+		case Op::FPOrdNotEqual64:
+		case Op::FPOrdLessThan64:
+		case Op::FPOrdGreaterThan64:
+		case Op::FPUnordEqual64:
+		case Op::FPUnordNotEqual64:
+		case Op::FPUnordLessThan64:
+		case Op::FPUnordGreaterThan64:
+		case Op::FPUnordLessThanEqual64:
+		case Op::FPUnordGreaterThanEqual64:
+		case Op::FPUnordEqual32:
+		case Op::FPOrdNotEqual32:
+		case Op::FPUnordNotEqual32:
+		case Op::FPOrdLessThan32:
+		case Op::FPUnordLessThan32:
+		case Op::FPOrdGreaterThan32:
+		case Op::FPUnordGreaterThan32:
+		case Op::FPOrdLessThanEqual32:
+		case Op::FPUnordLessThanEqual32:
+		case Op::FPOrdGreaterThanEqual32:
+		case Op::FPUnordGreaterThanEqual32:
+		case Op::FPIsNan32:
+		case Op::FPIsNan64:
+		case Op::FPCmpClass32:
+		case Op::FPCmpClass16:
+		case Op::FPAdd32:
+		case Op::FPSub32:
+		case Op::FPFma32:
+		case Op::FPMad32:
+		case Op::FPMul32:
+		case Op::FPAdd64:
+		case Op::FPMul64:
+		case Op::FPFma64:
+		case Op::FPRecip64:
+		case Op::FPMin32:
+		case Op::FPMax32:
+		case Op::FPMin64:
+		case Op::FPMax64:
+		case Op::FPMinTri32:
+		case Op::FPMaxTri32:
+		case Op::FPMedTri32:
+		case Op::FPRecip32:
+		case Op::FPRecipIFlag32:
+		case Op::FPRecipSqrt32:
+		case Op::FPSqrt:
+		case Op::FPSin:
+		case Op::FPCos:
+		case Op::FPExp2:
+		case Op::FPLog2:
+		case Op::FPLdexp:
+		case Op::FPRoundEven32:
+		case Op::FPFloor32:
+		case Op::FPCeil32:
+		case Op::FPTrunc32:
+		case Op::FPFloor64:
+		case Op::FPCeil64:
+		case Op::FPTrunc64:
+		case Op::FPFract32:
+		case Op::FPFract64: return true;
+		default: return false;
+	}
+}
+
+void ComputeUniformInsts(const IR::Program& program,
+                         std::unordered_set<const IR::Inst*>& uniform_insts) {
+	uniform_insts.clear();
+	std::vector<const IR::Inst*> candidates;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IsInherentlyUniform(inst, program)) {
+				uniform_insts.insert(&inst);
+			} else if (IsUniformPreservingOp(inst, program)) {
+				uniform_insts.insert(&inst);
+				candidates.push_back(&inst);
+			}
+		}
+	}
+	std::vector<const IR::Inst*> worklist;
+	for (const auto* inst: candidates) {
+		for (size_t i = 0; i < inst->NumArgs(); ++i) {
+			const auto* arg_inst = inst->Arg(i).TryInstruction();
+			if (arg_inst != nullptr && !uniform_insts.contains(arg_inst)) {
+				uniform_insts.erase(inst);
+				worklist.push_back(inst);
+				break;
+			}
+		}
+	}
+	for (size_t i = 0; i < worklist.size(); ++i) {
+		const auto* bad = worklist[i];
+		for (const auto& use: bad->Uses()) {
+			const auto* user = use.user;
+			if (!IsInherentlyUniform(*user, program) && uniform_insts.erase(user) != 0u) {
+				worklist.push_back(user);
+			}
+		}
+	}
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	using Op = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupReduceU32 ||
 	     op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
-	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
-		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
+	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress) ||
+	     ctx.state.uniform_insts.contains(&inst))) {
+		// Whole-wave results, clocks, uniform values and SMEM loads match in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
@@ -253,6 +498,10 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
                                const IR::Inst& inst) {
+	if (ctx.half != 0 && ctx.state.uniform_insts.contains(&inst)) {
+		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
 	if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 		const auto type = TypeId(ctx.state, inst.GetType());
 		if (type == 0 || inst.NumArgs() == 0) {
@@ -606,6 +855,7 @@ void EmitProgram(EmitterState& state) {
 		ctx.other_half  = &high;
 		high.other_half = &ctx;
 		high.half       = 1;
+		ComputeUniformInsts(program, state.uniform_insts);
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.program.stage == ShaderType::Pixel && state.program.info.pixel_valid_mask) {
@@ -676,6 +926,8 @@ void EmitProgram(EmitterState& state) {
 		high.dispatcher_spills      = &dispatch.spills[1];
 	}
 	DefineGetBdaPointer(state);
+	DefineLoadBdaFunctions(state);
+	DefineMinMaxF32Functions(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineBvhIntersect(state);
 	DefineTrinityFunctions(state);

@@ -24,7 +24,7 @@
 
 namespace Libs::Graphics {
 
-static vk::BlendFactor GetBlendFactor(uint32_t factor) {
+vk::BlendFactor VulkanBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kZero: return vk::BlendFactor::eZero;
 		case Prospero::BlendFactor::kOne: return vk::BlendFactor::eOne;
@@ -52,7 +52,7 @@ static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	return vk::BlendFactor::eZero;
 }
 
-static vk::BlendOp GetBlendOp(uint32_t op) {
+vk::BlendOp VulkanBlendOp(uint32_t op) {
 	switch (static_cast<Prospero::BlendOp>(op)) {
 		case Prospero::BlendOp::kAdd: return vk::BlendOp::eAdd;
 		case Prospero::BlendOp::kSubtract: return vk::BlendOp::eSubtract;
@@ -74,6 +74,25 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
 		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
+}
+
+// Creates the pipeline. Fast: from the driver cache if it holds it, else unoptimized and outside
+// the cache, which the driver builds many times faster (Pipeline::unoptimized). Optimize: the
+// optimized build of such a pipeline, with the layouts it already has.
+template <typename Info, typename Create>
+static vk::Result CreatePipelineHandle(PipelineCache::Pipeline& pipeline, Info info,
+                                       vk::PipelineCache driver_cache, PipelineBuild build,
+                                       Create create) {
+	if (build != PipelineBuild::Fast) return create(driver_cache, info);
+	if (driver_cache != nullptr) {
+		auto lookup = info;
+		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		if (create(driver_cache, lookup) == vk::Result::eSuccess) return vk::Result::eSuccess;
+		pipeline.pipeline = nullptr;
+	}
+	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	pipeline.unoptimized = true;
+	return create(nullptr, info);
 }
 
 // Creates the descriptor set layout and the pipeline layout that uses it.
@@ -200,7 +219,7 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+                            vk::PipelineCache driver_cache, PipelineBuild build) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -321,20 +340,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
 		color_blend_attachment[i].blendEnable = static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
 		color_blend_attachment[i].srcColorBlendFactor =
-		    GetBlendFactor(static_params.color_srcblend[i]);
+		    VulkanBlendFactor(static_params.color_srcblend[i]);
 		color_blend_attachment[i].dstColorBlendFactor =
-		    GetBlendFactor(static_params.color_destblend[i]);
-		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
+		    VulkanBlendFactor(static_params.color_destblend[i]);
+		color_blend_attachment[i].colorBlendOp = VulkanBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i])
+		         ? VulkanBlendFactor(static_params.alpha_srcblend[i])
 		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_destblend[i])
+		         ? VulkanBlendFactor(static_params.alpha_destblend[i])
 		         : color_blend_attachment[i].dstColorBlendFactor);
 		color_blend_attachment[i].alphaBlendOp =
-		    (static_params.separate_alpha_blend[i] ? GetBlendOp(static_params.alpha_comb_fcn[i])
+		    (static_params.separate_alpha_blend[i] ? VulkanBlendOp(static_params.alpha_comb_fcn[i])
 		                                           : color_blend_attachment[i].colorBlendOp);
 	}
 
@@ -355,7 +374,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			pipeline.push_stages |= native_stage;
 		}
 	}
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
+	if (build != PipelineBuild::Optimize) CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -383,6 +402,34 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+	}
+	if (!mesh) {
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveTopology);
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveRestartEnable);
+	}
+	if (graphics.eds3_polygon_mode) {
+		dynamic_states.push_back(vk::DynamicState::ePolygonModeEXT);
+	}
+	if (graphics.eds3_depth_clip_enable) {
+		dynamic_states.push_back(vk::DynamicState::eDepthClipEnableEXT);
+	}
+	if (graphics.eds3_depth_clip_negative_one_to_one) {
+		dynamic_states.push_back(vk::DynamicState::eDepthClipNegativeOneToOneEXT);
+	}
+	if (graphics.eds3_provoking_vertex_mode) {
+		dynamic_states.push_back(vk::DynamicState::eProvokingVertexModeEXT);
+	}
+	if (graphics.eds3_alpha_to_coverage_enable) {
+		dynamic_states.push_back(vk::DynamicState::eAlphaToCoverageEnableEXT);
+	}
+	if (graphics.eds3_color_blend_enable) {
+		dynamic_states.push_back(vk::DynamicState::eColorBlendEnableEXT);
+	}
+	if (graphics.eds3_color_blend_equation) {
+		dynamic_states.push_back(vk::DynamicState::eColorBlendEquationEXT);
+	}
+	if (graphics.eds3_color_write_mask) {
+		dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
 	}
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
@@ -412,8 +459,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
+	const auto result = CreatePipelineHandle(
+	    pipeline, pipeline_info, driver_cache, build,
+	    [&](vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info) {
+		    return graphics.device.createGraphicsPipelines(cache, 1, &info, nullptr,
+		                                                   &pipeline.pipeline);
+	    });
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -422,7 +473,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+                            const ShaderModule& module, vk::PipelineCache driver_cache,
+                            PipelineBuild build) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -439,7 +491,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = module.info.info.uses_image_heap;
 	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
+	if (build != PipelineBuild::Optimize) CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
@@ -448,8 +500,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
-	const auto result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	const auto result = CreatePipelineHandle(
+	    pipeline, info, driver_cache, build,
+	    [&](vk::PipelineCache cache, const vk::ComputePipelineCreateInfo& create) {
+		    return graphics.device.createComputePipelines(cache, 1, &create, nullptr,
+		                                                  &pipeline.pipeline);
+	    });
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 

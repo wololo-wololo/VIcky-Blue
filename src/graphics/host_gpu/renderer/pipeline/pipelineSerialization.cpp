@@ -66,6 +66,16 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
+void SeedBufferLayoutClasses(ShaderRecompiler::IR::ResourceSpecialization&       target,
+                             const ShaderRecompiler::IR::ResourceSpecialization& source) {
+	if (source.buffer_layout_classes.empty()) return;
+	auto& classes = target.buffer_layout_classes;
+	classes.insert(classes.end(), source.buffer_layout_classes.begin(),
+	               source.buffer_layout_classes.end());
+	std::ranges::sort(classes);
+	classes.erase(std::unique(classes.begin(), classes.end()), classes.end());
+}
+
 } // namespace
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
@@ -223,7 +233,15 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				m_program_cache.erase(program);
 				return false;
 			}
+			if (!inserted) {
+				// A later record's plan carries what the program learned since its first:
+				// lowered runtime layout threshold and grown table slots.
+				ShaderRecompiler::IR::ResourcePlan later;
+				if (!ShaderRecompiler::IR::LoadResourcePlan(plan, later)) return false;
+				ShaderRecompiler::IR::MergeRuntimeLayoutState(program->second.resource_plan, later);
+			}
 			module.module = CompileSPV(spirv, m_graphics.device);
+			SeedBufferLayoutClasses(program->second.specialization, module.specialization);
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

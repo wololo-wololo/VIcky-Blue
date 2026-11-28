@@ -1,5 +1,6 @@
 #include "FileTimeTestUtil.h"
 #include "common/assert.h"
+#include "common/asyncJobs.h"
 #include "common/config.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <gtest/gtest.h>
 #include <string>
 #include <string_view>
@@ -352,6 +354,73 @@ TEST(Thread, ReservesTheFastestCoreAndRestoresTheProcessAffinity) {
 	EXPECT_TRUE(CPU_EQUAL(&restored, &reserved));
 }
 #endif
+
+// Polls jobs until want results are taken or two seconds pass.
+template <class Jobs, class Results>
+void TakeUntil(Jobs& jobs, Results& results, size_t want) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (results.size() < want && std::chrono::steady_clock::now() < deadline) {
+		for (auto& result: jobs.TakeFinished()) results.push_back(std::move(result));
+		std::this_thread::yield();
+	}
+}
+
+TEST(AsyncJobs, RunsJobsOffTheCallerAndHandsBackEachResultOnce) {
+	Common::AsyncJobs<int> jobs(2);
+	const auto caller = std::this_thread::get_id();
+	std::promise<void> gate;
+	auto opened = gate.get_future().share();
+	std::atomic<bool> off_caller = true;
+	const auto blocked = jobs.Submit([&, opened] {
+		off_caller = off_caller && std::this_thread::get_id() != caller;
+		opened.wait();
+		return 7;
+	});
+	const auto quick = jobs.Submit([&] {
+		off_caller = off_caller && std::this_thread::get_id() != caller;
+		return 3;
+	});
+	EXPECT_NE(blocked, quick);
+	std::vector<std::pair<uint64_t, int>> results;
+	TakeUntil(jobs, results, 1);
+	ASSERT_EQ(results.size(), 1u);
+	EXPECT_EQ(results[0], std::make_pair(quick, 3));
+	EXPECT_TRUE(jobs.Pending(blocked));
+	EXPECT_FALSE(jobs.Pending(quick));
+	gate.set_value();
+	TakeUntil(jobs, results, 2);
+	ASSERT_EQ(results.size(), 2u);
+	EXPECT_EQ(results[1], std::make_pair(blocked, 7));
+	EXPECT_FALSE(jobs.Pending(blocked));
+	EXPECT_TRUE(jobs.TakeFinished().empty());
+	EXPECT_TRUE(off_caller);
+}
+
+TEST(AsyncJobs, DestructionWaitsForRunningJobsAndDropsQueuedOnes) {
+	std::atomic<int> started = 0, finished = 0;
+	{
+		Common::AsyncJobs<int> jobs(1);
+		std::promise<void> running;
+		auto running_future = running.get_future();
+		jobs.Submit([&] {
+			started++;
+			running.set_value();
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			finished++;
+			return 0;
+		});
+		for (int i = 0; i < 8; ++i) {
+			jobs.Submit([&] {
+				started++;
+				finished++;
+				return 0;
+			});
+		}
+		running_future.wait();
+	}
+	EXPECT_EQ(started.load(), 1);
+	EXPECT_EQ(finished.load(), 1);
+}
 
 } // namespace
 

@@ -21494,7 +21494,8 @@ public:
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
                           uint32_t vertex_count = 3,
-                          std::array<u32, 4> clear_value = {}) {
+                          std::array<u32, 4> clear_value = {},
+                          vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList) {
       vk::ClearValue clear{};
       clear.color.uint32 = clear_value;
       TextureCacheTestAccess::ClearImage(
@@ -21563,6 +21564,8 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
       cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      cmd.setPrimitiveTopology(topology);
+      cmd.setPrimitiveRestartEnable(VK_FALSE);
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -22165,7 +22168,8 @@ public:
              .user_data = &native_user_data,
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
         native_programs();
-        draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4);
+        draw(pipeline(true, 2, 2, false, false, vk::PrimitiveTopology::eTriangleStrip), 4, {},
+             vk::PrimitiveTopology::eTriangleStrip);
         const auto pixels = read_color();
         bool second_triangle = false;
         for (size_t component = 0; component < pixels.size(); component += 4) {
@@ -30214,13 +30218,15 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 12, 30); // Runtime inputs prevent folding.
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 7);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 0);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 12, 30);
   AppendVMovLiteral(&code, 10, 0xa1b2c3d4u);
-  AppendVMovU32(&code, 12, 64);
   code.push_back(0x261418f9u);
   code.push_back(0x0686149fu);
   AppendStoreVgpr(&code, 10, 1);
@@ -30229,9 +30235,10 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   TestCase test;
   test.name = "Vop2SdwaMinU32PreservesWordDestination";
   test.code = code;
+  test.initial = {7u, 64u};
   test.expected = {0xa1b20007u, 0xa1b2001fu};
-  test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {" UMin ", "OpSelect"};
   return test;
 }
@@ -30825,7 +30832,7 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 3}};
+  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 2}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -32734,6 +32741,176 @@ TestCase Vop1MoveRelDestinationSkipsLaneSpill() {
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// A loop with M0 derived from IMul32(3, BitFieldUExtract(src, dyn_off, 2)) keeps M0 in [0, 9]
+// with stride 3 across backedges, folding out-of-range and non-multiple V_MOVREL comparisons.
+TestCase Vop1MoveRelBoundedStridedLoop() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Vop1MoveRelBoundedStridedLoop";
+  // BFE(..., shift=2, width=2): 0x0c -> 3 (M0=9), 0x04 -> 1 (M0=3).
+  test.initial = {0x0cu, 0x04u};
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 0, 0x50000000u);
+  for (u32 reg = 12; reg <= 35; reg++) AppendVMovLiteral(&code, reg, 0x1000u + reg);
+  AppendVMovLiteral(&code, 11, 2u);
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+
+  const auto loop = code.size();
+  // v30 = (s20 << 2) for loading initial[iter].
+  code.push_back(EncodeVop1(0x01, 30, 20));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
+  AppendBufferLoadDword(&code, 10, 30);
+  // v10 = 3 * BFE(v10, v11, 2) -> [0, 9], stride 3.
+  AppendVop3(&code, 0x148u, 10, Vgpr(10), Vgpr(11), InlineU32(2u));
+  AppendVop3(&code, 0x169u, 10, InlineU32(3u), Vgpr(10));
+  code.push_back(EncodeVop1(0x02, 8, Vgpr(10))); // v_readfirstlane_b32 s8, v10
+  code.push_back(EncodeSMovB32(124, 8));          // s_mov_b32 m0, s8
+  // Distinct non-trivial value computed in loop: 0x7700 + s20.
+  code.push_back(EncodeVop1(0x01, 9, 20));
+  code.push_back(EncodeVop2(0x25, 9, 255u, 9)); // v_add_u32 v9, 0x7700, v9
+  code.push_back(0x00007700u);
+  code.push_back(EncodeVop1(0x42, 12, Vgpr(9)));  // v_movreld_b32 v12, v9
+  code.push_back(EncodeVop1(0x43, 34, Vgpr(12))); // v_movrels_b32 v34, v12
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1))); // s_add_u32 s20, s20, 1
+  code.push_back(EncodeSopc(0x0a, 20, InlineU32(2)));     // s_cmp_lt_u32 s20, 2
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+
+  AppendStoreVgpr(&code, 34, 0);
+  AppendStoreVgpr(&code, 21, 1); // v12 + 9
+  AppendStoreVgpr(&code, 15, 2); // v12 + 3
+  AppendStoreVgpr(&code, 13, 3); // v12 + 1 (untouched)
+  AppendEnd(&code);
+
+  test.expected = {0x7701u, 0x7700u, 0x7701u, 0x100du};
+  test.opcodes = {O::V_MOV_B32,    O::BUFFER_LOAD_DWORD, O::V_BFE_U32,
+                  O::V_MUL_LO_U32, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::V_MOVRELD_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.ir_counts = {{" = IEqual32 ", 4}};
+  return test;
+}
+
+// Guarded SelectU32 inside a Phi's incoming edge is eliminated when all consumers of the Phi
+// are guarded by an outer EXEC predicate that strictly dominates the Phi block.
+TestCase ExecGuardedSelectEliminatedAcrossInnerPhi() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 4);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  AppendBufferLoadDword(&code, 2, 5);
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 1));
+  code.push_back(EncodeSop1(0x24, 10, 106)); // s_and_saveexec_b64 s[10:11], vcc
+  const auto outer_branch = code.size();
+  code.push_back(0);
+  AppendVMovLiteral(&code, 3, 0x11111111u);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 2));
+  code.push_back(EncodeSop1(0x24, 12, 106)); // s_and_saveexec_b64 s[12:13], vcc
+  const auto inner_branch = code.size();
+  code.push_back(0);
+  AppendVMovLiteral(&code, 3, 0x22222222u);
+  const auto inner_merge = code.size();
+  code[inner_branch] = EncodeSopp(0x08, static_cast<u32>(inner_merge - inner_branch - 1u));
+  code.push_back(EncodeSop1(0x04, 126, 12)); // s_mov_b64 exec, s[12:13]
+  code.push_back(EncodeVop2(0x25, 6, InlineU32(32), 4));
+  AppendBufferStoreDword(&code, 3, 6);
+  const auto outer_merge = code.size();
+  code[outer_branch] = EncodeSopp(0x08, static_cast<u32>(outer_merge - outer_branch - 1u));
+  code.push_back(EncodeSop1(0x04, 126, 10)); // s_mov_b64 exec, s[10:11]
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ExecGuardedSelectEliminatedAcrossInnerPhi";
+  test.code = std::move(code);
+  test.initial = {1u, 1u, 0u, 1u,
+                  0u, 1u, 0u, 1u,
+                  0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
+  test.expected = test.initial;
+  test.expected[8] = 0x22222222u;
+  test.expected[9] = 0x11111111u;
+  test.expected[11] = 0x11111111u;
+  test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
+                  O::V_MOV_B32,     O::V_CMP_NE_U32, O::S_AND_SAVEEXEC_B64,
+                  O::S_CBRANCH_EXECZ, O::V_CMP_EQ_U32, O::S_MOV_B64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{" = SelectU32 ", 0}};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+// Divergent wave32 if/else region without cross-lane or barrier ops lowers to per-lane
+// ScalarInstruction branches, eliminating OpGroupNonUniformAny and software Select/guard merges.
+TestCase LowerDivergentExecRegionWave32() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0)); // v4 = tid * 4
+  AppendBufferLoadDword(&code, 1, 4);                   // v1 = input[tid]
+  AppendVMovLiteral(&code, 3, 100u);                    // v3 = 100
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 1));    // v_cmp_ne_u32 vcc, 0, v1
+  code.push_back(EncodeSop1(0x24, 10, 106));            // s_and_saveexec_b64 s[10:11], vcc
+  const auto if_branch = code.size();
+  code.push_back(0);
+  // Active arm: v2 = input[tid + 4] + 10, store into output[tid + 8] = v2.
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  AppendBufferLoadDword(&code, 2, 5);
+  code.push_back(EncodeVop2(0x25, 3, InlineU32(10), 2));
+  code.push_back(EncodeVop2(0x25, 6, InlineU32(32), 4));
+  AppendBufferStoreDword(&code, 3, 6);
+  const auto else_label = code.size();
+  code[if_branch] = EncodeSopp(0x08, static_cast<u32>(else_label - if_branch - 1u));
+  code.push_back(EncodeSop2(0x13, 126, 126, 10)); // s_xor_b64 exec, exec, s[10:11]
+  const auto else_branch = code.size();
+  code.push_back(0);
+  // Else arm: v3 = input[tid + 4] + 200.
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  AppendBufferLoadDword(&code, 2, 5);
+  AppendVMovLiteral(&code, 7, 200u);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(7), 2));
+  const auto merge_label = code.size();
+  code[else_branch] = EncodeSopp(0x08, static_cast<u32>(merge_label - else_branch - 1u));
+  code.push_back(EncodeSop2(0x11, 126, 126, 10)); // s_or_b64 exec, exec, s[10:11]
+  code.push_back(EncodeVop2(0x25, 8, InlineU32(48), 4));
+  AppendBufferStoreDword(&code, 3, 8);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LowerDivergentExecRegionWave32";
+  test.code = std::move(code);
+  test.initial = {
+      1u, 0u, 1u, 0u,     // branch selector
+      5u, 6u, 7u, 8u,     // secondary input
+      0u, 0u, 0u, 0u,     // slot 8..11: only written by active arm (lanes 0, 2)
+      0u, 0u, 0u, 0u,     // slot 12..15: merged result from both arms
+  };
+  test.expected = test.initial;
+  test.expected[8]  = 15u;
+  test.expected[10] = 17u;
+  test.expected[12] = 15u;
+  test.expected[13] = 206u;
+  test.expected[14] = 17u;
+  test.expected[15] = 208u;
+  test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
+                  O::V_MOV_B32,     O::V_CMP_NE_U32, O::S_AND_SAVEEXEC_B64,
+                  O::S_CBRANCH_EXECZ, O::S_XOR_B64, O::S_OR_B64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{" = SelectU32 ", 0}};
+  test.forbidden_spirv = {"OpGroupNonUniformAny"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
   test.has_compute_info = true;
   return test;
 }
@@ -44623,7 +44800,8 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
   auto compiled = CompileCase(test, vulkan.SubgroupSize());
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
-  const auto halves = wave_size > vulkan.SubgroupSize() ? 2u : 1u;
+  // No cross-lane ops or LDS: a wave64 on a 32-wide host runs one lane per invocation.
+  const auto halves = 1u;
   Require(test.name, "direct dynamic offset", tools.Disassemble(compiled.spirv, &text) &&
               CountText(text, "OpImageSampleExplicitLod") == halves &&
               CountText(text, "OpBitFieldSExtract %int") == 2u * halves,
@@ -46310,7 +46488,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       if (layout != Layout::Shared && layout != Layout::IndexedNullChild && swapped) continue;
       // Repeated keys select two distinct logical buffers within one native allocation.
       // Keys below, between and above the live keys must not select either buffer.
-      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
+      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 5u, 3u,
                                          10u, swapped ? 0u : 1u,
                                          12u, swapped ? 1u : 0u,
                                          14u, swapped ? 0u : 1u};
@@ -46404,7 +46582,7 @@ void CheckIndirectBufferAtomic(VulkanHarness &vulkan) {
     CheckSpirvEmission(test, compiled.spirv);
 
     for (const bool swapped : {false, true}) {
-      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
+      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 5u, 3u,
                                          10u, swapped ? 0u : 1u,
                                          12u, swapped ? 1u : 0u,
                                          14u, swapped ? 0u : 1u};
@@ -48331,6 +48509,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   CompiledShader compiled;
   compiled.program = std::move(program);
   constexpr std::array ordinals{0u, 1u, 2u, 3u, 4u, 5u, 2u, 0u};
+  compiled.resources.flattened_srt.push_back(1u);
   compiled.resources.flattened_srt.push_back(ordinals.size());
   compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
                                           ordinals.begin(), ordinals.end());
@@ -48381,7 +48560,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
     selected_resources = homogeneous ? std::vector<u32>{0u, 2u, 3u, 5u, 6u}
                                      : root.indirect_resources;
     if (homogeneous) test.name = "IndirectImageGatherHomogeneous";
-    compiled.resources.flattened_srt[6] = homogeneous ? 4u : ordinals[5];
+    compiled.resources.flattened_srt[7] = homogeneous ? 4u : ordinals[5];
     if (mixed_mips) {
       test.name = "IndirectImageGatherMixedMips";
       compiled.program.info.images[3].mip_mode = ImageMipMode::Dynamic;
@@ -48483,7 +48662,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       test.initial.assign(wave_size, 0xdeadbeefu);
       test.expected.assign(wave_size, 0u);
       for (u32 lane = 0; lane < ordinals.size(); ++lane) {
-        const auto resource = selected_resources[compiled.resources.flattened_srt[1u + lane]];
+        const auto resource = selected_resources[compiled.resources.flattened_srt[2u + lane]];
         test.expected[lane] = std::bit_cast<u32>(float(resource +
             ((fetch && resource != 0u) || (mixed_mips && resource == 3u) ? 10u : 0u)));
       }
@@ -48800,6 +48979,7 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     compiled.resources.flattened_srt.clear();
     if (mapped) {
       // Only the sampler needs a lookup buffer: reverse its keys to distinct sampler ordinals.
+      compiled.resources.flattened_srt.push_back(1u);
       compiled.resources.flattened_srt.push_back(static_cast<u32>(table.size()));
       for (size_t index = table.size(); index != 0; --index)
         compiled.resources.flattened_srt.push_back(static_cast<u32>(index - 1u));
@@ -50990,6 +51170,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1MoveRelSourceRuntimeIndex);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
+  AddCase(Vop1MoveRelBoundedStridedLoop);
+  AddCase(ExecGuardedSelectEliminatedAcrossInnerPhi);
+  AddCase(LowerDivergentExecRegionWave32);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -54936,7 +55119,7 @@ void CheckImageSamplerSpecialization() {
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.images.size() == count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset];
     const auto ordinal = [&](u32 byte_offset) {
       const auto word = byte_offset >> 2u;
       return word < snapshot.flattened_srt[offset]

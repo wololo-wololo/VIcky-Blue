@@ -48,8 +48,10 @@ static uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
 }
 
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset) {
+	const auto base = LoadFlattenedSrt(state, ConstantU32(state, mapping_offset));
 	const auto Mapping = [&](uint32_t word) {
-		return LoadFlattenedSrt(state, ConstantU32(state, mapping_offset + word));
+		return LoadFlattenedSrt(state, word == 0u ? base
+		                                          : EmitAddU32(state, base, ConstantU32(state, word)));
 	};
 	// Keys past the table select its trailing null slot.
 	const auto index = EmitUMin32(state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
@@ -69,15 +71,14 @@ uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource) {
-	const auto mapping = ConstantU32(state, mapping_offset);
+	const auto mapping = LoadFlattenedSrt(state, ConstantU32(state, mapping_offset));
 	const auto count = LoadFlattenedSrt(state, mapping);
 	if (search_iterations == 0u) {
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
 		                          ConstantU32(state, 2u));
 		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
 		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
-		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
+		const auto entry = EmitAddU32(state, EmitAddU32(state, mapping, ConstantU32(state, 1u)), safe);
 		return Select(state, TypeU32(state), valid, LoadFlattenedSrt(state, entry),
 		              ConstantU32(state, default_resource));
 	}
@@ -115,8 +116,8 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 }
 
 uint32_t EmitRuntimeBufferLayout(EmitterState& state, const IR::BufferResource& root, uint32_t selected) {
-	const auto mapping = root.indirect_mapping_offset;
-	const auto header = LoadFlattenedSrt(state, ConstantU32(state, mapping));
+	const auto mapping = LoadFlattenedSrt(state, ConstantU32(state, root.indirect_mapping_offset));
+	const auto header = LoadFlattenedSrt(state, mapping);
 	const auto mapping_words = root.indirect_search_iterations != 0u
 	    ? Binary(state, spv::OpShiftLeftLogical, TypeU32(state), header, ConstantU32(state, 1u))
 	    : header;
@@ -124,7 +125,7 @@ uint32_t EmitRuntimeBufferLayout(EmitterState& state, const IR::BufferResource& 
 	                          ConstantU32(state, static_cast<uint32_t>(root.indirect_resources.size())));
 	const auto ordinal = Select(state, TypeU32(state), valid, selected, ConstantU32(state, 0u));
 	return LoadFlattenedSrt(state, EmitAddU32(state, EmitAddU32(state, mapping_words, ordinal),
-	                                          ConstantU32(state, mapping + 1u)));
+	                                          EmitAddU32(state, mapping, ConstantU32(state, 1u))));
 }
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
@@ -222,11 +223,17 @@ void EmitMemoryBindings(EmitterState& state) {
 	state.memory_byte_sizes.resize(count);
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
-		// Runtime-layout candidates load their offsets and sizes per access, by runtime slot.
+		// Runtime-layout, shared, and grouped indirect candidates load offsets and sizes per access.
 		if (state.program.info.buffers[resource].runtime_layout_classes == 0u &&
-		    SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
+		    SharedIndirectBufferResource(state, resource) == UINT32_MAX &&
+		    GroupIndirectBufferCandidates(state, resource).representatives.empty()) {
+			continue;
+		}
 		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
-			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
+			const auto desc = state.program.info.buffers[candidate].descriptor_index;
+			if (desc < count) {
+				dynamic_offsets[desc] = true;
+			}
 		}
 	}
 	for (uint32_t i = 0; i < count; i += 4u) {

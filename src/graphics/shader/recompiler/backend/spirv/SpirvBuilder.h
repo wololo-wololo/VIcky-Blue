@@ -134,6 +134,14 @@ private:
 	uint32_t    DeclareConstant(spv::Op opcode);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
+	struct DeclEntry {
+		uint32_t offset = 0;
+		uint32_t count  = 0;
+		uint32_t hash   = 0;
+		uint32_t id     = 0;
+	};
+	uint32_t    FindOrInsertDeclaration(std::span<const uint32_t> key, bool& inserted);
+
 	uint32_t                                  m_next_id = 1;
 	uint32_t                                  m_version = 0;
 	std::vector<uint32_t>                     m_capabilities;
@@ -149,7 +157,9 @@ private:
 	std::set<spv::Capability>                 m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	std::vector<uint32_t>                     m_declaration_key_pool;
+	std::vector<DeclEntry>                    m_declaration_entries;
+	std::vector<uint32_t>                     m_declaration_buckets;
 	std::vector<uint32_t>                     m_key; // Reused declaration lookup key.
 	size_t                                    m_unpatched_phi_incomings = 0;
 	bool                                      m_emit_names              = false;

@@ -55,6 +55,25 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	}
 }
 
+vk::PrimitiveTopology CanonicalTopologyClass(const vk::PrimitiveTopology topology) noexcept {
+	switch (topology) {
+		case vk::PrimitiveTopology::ePointList: return vk::PrimitiveTopology::ePointList;
+		case vk::PrimitiveTopology::eLineList:
+		case vk::PrimitiveTopology::eLineStrip:
+		case vk::PrimitiveTopology::eLineListWithAdjacency:
+		case vk::PrimitiveTopology::eLineStripWithAdjacency:
+			return vk::PrimitiveTopology::eLineList;
+		case vk::PrimitiveTopology::eTriangleList:
+		case vk::PrimitiveTopology::eTriangleStrip:
+		case vk::PrimitiveTopology::eTriangleFan:
+		case vk::PrimitiveTopology::eTriangleListWithAdjacency:
+		case vk::PrimitiveTopology::eTriangleStripWithAdjacency:
+			return vk::PrimitiveTopology::eTriangleList;
+		case vk::PrimitiveTopology::ePatchList: return vk::PrimitiveTopology::ePatchList;
+		default: return topology;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -434,9 +453,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
+		auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (plan.runtime_layout_min_candidates == 0u && translated.program.blocks.size() >= 64u) {
+			plan.runtime_layout_min_candidates = 2u;
+		}
 		entry = m_program_cache.emplace(m_lookup_key, Program {
 		    .call_source   = std::move(retained),
-		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		    .resource_plan = std::move(plan),
 		}).first;
 		auto& program = entry->second;
 		if (!ShaderRecompiler::IR::MaterializeResources(
@@ -452,12 +475,60 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			return nullptr;
 		}
 	} else if (source_changed) {
-		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (plan.runtime_layout_min_candidates == 0u && translated.program.blocks.size() >= 64u) {
+			plan.runtime_layout_min_candidates = 2u;
+		}
+		entry->second.resource_plan = std::move(plan);
 		bool specialized = true;
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data, specialized)) {
 			return bind(*module);
 		}
 		if (!specialized) return SkipRespecialization(entry->second, params.hash, options.stage);
+	}
+	if (const auto& program = entry->second; !program.modules.empty()) {
+		// Another module of a known program: which input none of its modules had.
+		const auto code = program.FunctionCode();
+		const bool new_code = std::ranges::none_of(program.modules, [&](const ShaderModule& m) {
+			return std::ranges::equal(m.function_code, code);
+		});
+		const bool new_resources = std::ranges::none_of(program.modules, [&](const ShaderModule& m) {
+			return m.specialization == program.specialization;
+		});
+		// The resources that differ from the last module's.
+		const auto& last = program.modules.back().specialization;
+		const auto& now  = program.specialization;
+		std::string differ;
+		const auto  slots = [&](const char* name, const auto& a, const auto& b) {
+            for (size_t i = 0; i < std::max(a.size(), b.size()); i++) {
+                if (i >= a.size() || i >= b.size() || !(a[i] == b[i])) differ += fmt::format(" {}{}", name, i);
+            }
+		};
+		slots("b", last.buffers, now.buffers);
+		slots("i", last.images, now.images);
+		slots("s", last.samplers, now.samplers);
+		if (last.buffer_layout_classes != now.buffer_layout_classes) differ += " layout_classes";
+		PipelineCacheLog("variant {} of shader=0x{:016x}: new callee code={} new resources={} "
+		                 "differs from last:{}",
+		                 program.modules.size() + 1, params.hash, new_code, new_resources, differ);
+	}
+	// A program that respecializes on its buffers alone keeps meeting new table states (a
+	// captured compute shader compiled seven modules of seconds each in one cutscene): its tables
+	// take runtime layouts from now on, so later states share the module compiled next.
+	if (auto& program = entry->second;
+	    !program.modules.empty() && program.resource_plan.runtime_layout_min_candidates == 0u &&
+	    program.modules.back().specialization.buffers != program.specialization.buffers &&
+	    std::ranges::any_of(program.modules, [&](const ShaderModule& m) {
+		    return std::ranges::equal(m.function_code, program.FunctionCode());
+	    })) {
+		program.resource_plan.runtime_layout_min_candidates = 2u;
+		PipelineCacheLog("shader=0x{:016x}: buffer tables respecialized, runtime layouts from now on",
+		                 params.hash);
+		bool specialized = true;
+		const auto* module = program.call_source ? program.FindModule<true>(runtime, push_data, specialized)
+		                                         : program.FindModule<false>(runtime, push_data, specialized);
+		if (!specialized) return SkipRespecialization(program, params.hash, options.stage);
+		if (module != nullptr) return bind(*module);
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data));
@@ -469,11 +540,108 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (const char* text = std::getenv("KYTY_PIPELINE_FAST_BUILD"); text != nullptr) {
+		m_fast_build = std::string_view(text) != "0";
+	}
+	const auto hardware = std::max(std::thread::hardware_concurrency(), 1u);
+	m_optimizer_threads = std::clamp(hardware > 2u ? hardware - 2u : 1u, 2u, 12u);
+	if (const char* text = std::getenv("KYTY_PIPELINE_OPT_THREADS"); text != nullptr) {
+		const auto requested = std::strtoul(text, nullptr, 10);
+		if (requested >= 1u && requested <= 64u) m_optimizer_threads = static_cast<uint32_t>(requested);
+	}
 	InitializeDriverCache();
 	WarmUp(shader_store);
 }
 
+// A pipeline creation that held the render thread for 100 ms or more, with its stages' hashes.
+template <size_t N>
+static void LogSlowPipeline(const char* kind, const PipelineCache::Pipeline& pipeline,
+                            const std::array<const ShaderModule*, N>&  stages,
+                            std::chrono::steady_clock::time_point      start) {
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                    std::chrono::steady_clock::now() - start)
+	                    .count();
+	if (ms < 100) return;
+	std::string hashes;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) hashes += fmt::format(" 0x{:016x}", stage->info.shader_hash);
+	}
+	PipelineCacheLog("slow {} pipeline: {} ms{} stages:{}", kind, ms,
+	                 pipeline.unoptimized ? " (unoptimized)" : "", hashes);
+}
+
+PipelineBuild PipelineCache::FirstBuild() const {
+	return m_fast_build ? PipelineBuild::Fast : PipelineBuild::Full;
+}
+
+void PipelineCache::PromoteOptimized() {
+	if (m_optimizing == 0) return;
+	if (m_optimized != nullptr) {
+		std::lock_guard lock(m_optimized->mutex);
+		for (const auto& [pipeline, optimized]: m_optimized->finished) {
+			m_replaced_pipelines.push_back(pipeline->pipeline);
+			pipeline->pipeline    = optimized;
+			pipeline->unoptimized = false;
+			m_optimizing--;
+			m_optimizing_in_flight--;
+		}
+		m_optimized->finished.clear();
+	}
+	if (m_pending_optimizations.empty() || m_optimizing_in_flight >= m_optimizer_threads) return;
+	if (std::chrono::steady_clock::now() - m_last_cold_build < OptimizerIdleDelay) return;
+	if (m_optimizer == nullptr) {
+		m_optimized = std::make_shared<OptimizedBuilds>();
+		m_optimizer = std::make_unique<Common::AsyncJobs<bool>>(m_optimizer_threads);
+	}
+	while (!m_pending_optimizations.empty() && m_optimizing_in_flight < m_optimizer_threads) {
+		auto pending = std::move(m_pending_optimizations.front());
+		m_pending_optimizations.pop_front();
+		m_optimizing_in_flight++;
+		m_optimizer->Submit([target = pending.target, layouts = std::move(pending.layouts),
+		                     build = std::move(pending.build), builds = m_optimized,
+		                     device = m_graphics.device]() mutable {
+			build(layouts);
+			std::lock_guard lock(builds->mutex);
+			if (builds->stopping) {
+				device.destroyPipeline(layouts.pipeline, nullptr);
+			} else {
+				builds->finished.emplace_back(target, layouts.pipeline);
+			}
+			return true;
+		});
+	}
+}
+
+void PipelineCache::QueueOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build) {
+	if (!pipeline.unoptimized) return;
+	auto layouts     = pipeline;
+	layouts.pipeline = nullptr;
+	m_last_cold_build = std::chrono::steady_clock::now();
+	m_pending_optimizations.push_back(PendingOptimization {
+	    .target  = &pipeline,
+	    .layouts = std::move(layouts),
+	    .build   = std::move(build),
+	});
+	m_optimizing++;
+}
+
 PipelineCache::~PipelineCache() {
+	m_pending_optimizations.clear();
+	// Builds finished and not promoted are destroyed here, those still running by themselves.
+	if (m_optimizer != nullptr) {
+		{
+			std::lock_guard lock(m_optimized->mutex);
+			m_optimized->stopping = true;
+			for (const auto& [pipeline, optimized]: m_optimized->finished) {
+				(void)pipeline;
+				m_graphics.device.destroyPipeline(optimized, nullptr);
+			}
+		}
+		m_optimizer.reset();
+	}
+	for (const auto pipeline: m_replaced_pipelines) {
+		m_graphics.device.destroyPipeline(pipeline, nullptr);
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -901,15 +1069,16 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return module;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state,
-                                                            const DrawTargets&     targets) {
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+    const CommandBuffer& command, const DrawRenderState& state, const DrawTargets& targets,
+    PipelineStaticParameters* live_static_params, uint32_t* live_color_count) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	PromoteOptimized();
 
 	const bool ps_active    = state.ps_active;
 	const bool tessellation = vertex_info.size() == 3;
@@ -1030,8 +1199,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = state.topology;
-	static_params.primitive_restart_enable = state.primitive_restart_enable;
+	static_params.topology                 = CanonicalTopologyClass(state.topology);
+	static_params.primitive_restart_enable = false;
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
@@ -1071,6 +1240,31 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	if (live_static_params != nullptr) *live_static_params = static_params;
+	if (live_color_count != nullptr) *live_color_count = rendering.color_count;
+
+	if (m_graphics.eds3_polygon_mode) static_params.polygon_mode = vk::PolygonMode::eFill;
+	if (m_graphics.eds3_depth_clip_enable) static_params.depth_clip_enable = true;
+	if (m_graphics.eds3_depth_clip_negative_one_to_one) static_params.negative_one_to_one = false;
+	if (m_graphics.eds3_provoking_vertex_mode) static_params.provoking_vtx_last = false;
+	if (m_graphics.eds3_alpha_to_coverage_enable) static_params.alpha_to_coverage_enable = false;
+	if (m_graphics.eds3_color_blend_enable) {
+		std::fill(std::begin(static_params.blend_enable), std::end(static_params.blend_enable), false);
+	}
+	if (m_graphics.eds3_color_blend_equation) {
+		std::fill(std::begin(static_params.color_srcblend), std::end(static_params.color_srcblend), 0u);
+		std::fill(std::begin(static_params.color_comb_fcn), std::end(static_params.color_comb_fcn), 0u);
+		std::fill(std::begin(static_params.color_destblend), std::end(static_params.color_destblend), 0u);
+		std::fill(std::begin(static_params.alpha_srcblend), std::end(static_params.alpha_srcblend), 0u);
+		std::fill(std::begin(static_params.alpha_comb_fcn), std::end(static_params.alpha_comb_fcn), 0u);
+		std::fill(std::begin(static_params.alpha_destblend), std::end(static_params.alpha_destblend), 0u);
+		std::fill(std::begin(static_params.separate_alpha_blend),
+		          std::end(static_params.separate_alpha_blend), false);
+	}
+	if (m_graphics.eds3_color_write_mask) {
+		std::fill(std::begin(static_params.color_mask), std::end(static_params.color_mask), 0u);
+	}
+
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
@@ -1088,8 +1282,23 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		const auto start = std::chrono::steady_clock::now();
+		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache, FirstBuild());
+		LogSlowPipeline("graphics", pipeline, stages, start);
 	}
+	// The worker gets copies: program module lists may grow while it builds.
+	auto modules = std::make_shared<std::array<std::optional<ShaderModule>, 4>>();
+	for (size_t i = 0; i < stages.size(); i++) {
+		if (stages[i] != nullptr) (*modules)[i] = *stages[i];
+	}
+	QueueOptimized(pipeline, [this, key, modules](Pipeline& layouts) {
+		std::array<const ShaderModule*, 4> copies {};
+		for (size_t i = 0; i < copies.size(); i++) {
+			if ((*modules)[i]) copies[i] = &*(*modules)[i];
+		}
+		CreatePipelineInternal(m_graphics, layouts, key, copies, m_driver_cache,
+		                       PipelineBuild::Optimize);
+	});
 	StorePipeline(key);
 	CheckpointDriverCache();
 
@@ -1098,6 +1307,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+	PromoteOptimized();
 
 	const auto& module = *input_info.stage.module;
 
@@ -1115,8 +1325,13 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		const auto start = std::chrono::steady_clock::now();
+		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache, FirstBuild());
+		LogSlowPipeline("compute", pipeline, std::array<const ShaderModule*, 1> {&module}, start);
 	}
+	QueueOptimized(pipeline, [this, module = std::make_shared<ShaderModule>(module)](Pipeline& layouts) {
+		CreatePipelineInternal(m_graphics, layouts, *module, m_driver_cache, PipelineBuild::Optimize);
+	});
 	CheckpointDriverCache();
 
 	return pipeline;

@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOutliner.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -40,8 +41,14 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.builder.EnableNames();
 	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	const bool  single_lane_wave64 =
+	    program.stage == ShaderType::Compute && !program.info.subgroup_ballot &&
+	    !program.info.subgroup_vote && !program.info.subgroup_barrier &&
+	    !program.info.subgroup_shuffle && !program.info.subgroup_arithmetic &&
+	    !program.info.subgroup_local_invocation_id && !program.info.uses_lds;
 	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	    workgroup != nullptr && program.wave_size == 64u &&
+	    workgroup->host_subgroup_size == 32u && !single_lane_wave64
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
@@ -49,7 +56,9 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto words = state.builder.Build();
+	OutlineRepeatedRegions(words);
+	return words;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

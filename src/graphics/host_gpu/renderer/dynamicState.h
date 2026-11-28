@@ -54,10 +54,22 @@ struct DynamicState {
 		bool cull_mode  : 1;
 		bool front_face : 1;
 
-		bool blend_constants       : 1;
-		bool line_width            : 1;
-		bool feedback_loop_aspects : 1;
+		bool blend_constants               : 1;
+		bool line_width                    : 1;
+		bool feedback_loop_aspects         : 1;
+		bool primitive_topology            : 1;
+		bool primitive_restart_enable      : 1;
+		bool polygon_mode                  : 1;
+		bool depth_clip_enable             : 1;
+		bool depth_clip_negative_one_to_one : 1;
+		bool provoking_vertex_mode         : 1;
+		bool alpha_to_coverage_enable      : 1;
+		bool color_blend_enable            : 1;
+		bool color_blend_equation          : 1;
+		bool color_write_mask              : 1;
 	} dirty_state {};
+
+	static constexpr uint32_t MaxColorAttachments = 8u;
 
 	std::array<vk::Viewport, 16> viewports {};
 	std::array<vk::Rect2D, 16>   scissors {};
@@ -90,9 +102,20 @@ struct DynamicState {
 	vk::CullModeFlags cull_mode {};
 	vk::FrontFace     front_face {};
 
-	std::array<float, 4> blend_constants {};
-	float                line_width {};
-	vk::ImageAspectFlags feedback_loop_aspects {};
+	std::array<float, 4>  blend_constants {};
+	float                 line_width {};
+	vk::ImageAspectFlags  feedback_loop_aspects {};
+	vk::PrimitiveTopology primitive_topology {vk::PrimitiveTopology::ePointList};
+	bool                  primitive_restart_enable {};
+	vk::PolygonMode       polygon_mode {vk::PolygonMode::eFill};
+	bool                  depth_clip_enable {true};
+	bool                  depth_clip_negative_one_to_one {};
+	vk::ProvokingVertexModeEXT provoking_vertex_mode {vk::ProvokingVertexModeEXT::eFirstVertex};
+	bool                       alpha_to_coverage_enable {};
+	uint32_t                   color_attachment_count {};
+	std::array<vk::Bool32, MaxColorAttachments>              color_blend_enables {};
+	std::array<vk::ColorBlendEquationEXT, MaxColorAttachments> color_blend_equations {};
+	std::array<vk::ColorComponentFlags, MaxColorAttachments> color_write_masks {};
 
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
@@ -255,6 +278,88 @@ struct DynamicState {
 		if (feedback_loop_aspects != aspects) {
 			feedback_loop_aspects             = aspects;
 			dirty_state.feedback_loop_aspects = true;
+		}
+	}
+
+	void SetPrimitiveTopology(const vk::PrimitiveTopology topology) {
+		if (primitive_topology != topology) {
+			primitive_topology             = topology;
+			dirty_state.primitive_topology = true;
+		}
+	}
+
+	void SetPrimitiveRestartEnable(const bool enable) {
+		if (primitive_restart_enable != enable) {
+			primitive_restart_enable             = enable;
+			dirty_state.primitive_restart_enable = true;
+		}
+	}
+
+	void SetPolygonMode(const vk::PolygonMode mode) {
+		if (polygon_mode != mode) {
+			polygon_mode             = mode;
+			dirty_state.polygon_mode = true;
+		}
+	}
+
+	void SetDepthClipEnable(const bool enable) {
+		if (depth_clip_enable != enable) {
+			depth_clip_enable             = enable;
+			dirty_state.depth_clip_enable = true;
+		}
+	}
+
+	void SetDepthClipNegativeOneToOne(const bool negative) {
+		if (depth_clip_negative_one_to_one != negative) {
+			depth_clip_negative_one_to_one             = negative;
+			dirty_state.depth_clip_negative_one_to_one = true;
+		}
+	}
+
+	void SetProvokingVertexMode(const vk::ProvokingVertexModeEXT mode) {
+		if (provoking_vertex_mode != mode) {
+			provoking_vertex_mode             = mode;
+			dirty_state.provoking_vertex_mode = true;
+		}
+	}
+
+	void SetAlphaToCoverageEnable(const bool enable) {
+		if (alpha_to_coverage_enable != enable) {
+			alpha_to_coverage_enable             = enable;
+			dirty_state.alpha_to_coverage_enable = true;
+		}
+	}
+
+	void SetColorBlendState(
+	    uint32_t count, std::span<const vk::Bool32> enables,
+	    std::span<const vk::ColorBlendEquationEXT> equations,
+	    std::span<const vk::ColorComponentFlags>   masks) {
+		const uint32_t effective_count = std::clamp(count, 1u, MaxColorAttachments);
+		const bool     grew            = effective_count > color_attachment_count;
+		color_attachment_count         = effective_count;
+		if (grew) {
+			dirty_state.color_blend_enable   = true;
+			dirty_state.color_blend_equation = true;
+			dirty_state.color_write_mask     = true;
+		}
+		for (uint32_t i = 0; i < effective_count; i++) {
+			const vk::Bool32              en  = i < enables.size() ? enables[i] : VK_FALSE;
+			const vk::ColorBlendEquationEXT eq =
+			    i < equations.size() ? equations[i] : vk::ColorBlendEquationEXT {};
+			const vk::ColorComponentFlags m =
+			    i < masks.size() ? masks[i] : vk::ColorComponentFlags {};
+			if (color_blend_enables[i] != en) {
+				color_blend_enables[i]         = en;
+				dirty_state.color_blend_enable = true;
+			}
+			if (std::memcmp(&color_blend_equations[i], &eq, sizeof(eq)) != 0) {
+				color_blend_equations[i]         = eq;
+				dirty_state.color_blend_equation = true;
+			}
+			if (color_write_masks[i] != m) {
+				color_write_masks[i]         = m;
+				dirty_state.color_write_mask = true;
+			}
 		}
 	}
 };

@@ -145,6 +145,63 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.feedback_loop_aspects = false;
 		cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_aspects);
 	}
+	if (dirty_state.primitive_topology) {
+		dirty_state.primitive_topology = false;
+		cmdbuf.setPrimitiveTopology(primitive_topology);
+	}
+	if (dirty_state.primitive_restart_enable) {
+		dirty_state.primitive_restart_enable = false;
+		cmdbuf.setPrimitiveRestartEnable(primitive_restart_enable ? VK_TRUE : VK_FALSE);
+	}
+	if (dirty_state.polygon_mode) {
+		dirty_state.polygon_mode = false;
+		if (graphics.eds3_polygon_mode) {
+			cmdbuf.setPolygonModeEXT(polygon_mode);
+		}
+	}
+	if (dirty_state.depth_clip_enable) {
+		dirty_state.depth_clip_enable = false;
+		if (graphics.eds3_depth_clip_enable) {
+			cmdbuf.setDepthClipEnableEXT(depth_clip_enable ? VK_TRUE : VK_FALSE);
+		}
+	}
+	if (dirty_state.depth_clip_negative_one_to_one) {
+		dirty_state.depth_clip_negative_one_to_one = false;
+		if (graphics.eds3_depth_clip_negative_one_to_one) {
+			cmdbuf.setDepthClipNegativeOneToOneEXT(depth_clip_negative_one_to_one ? VK_TRUE : VK_FALSE);
+		}
+	}
+	if (dirty_state.provoking_vertex_mode) {
+		dirty_state.provoking_vertex_mode = false;
+		if (graphics.eds3_provoking_vertex_mode) {
+			cmdbuf.setProvokingVertexModeEXT(provoking_vertex_mode);
+		}
+	}
+	if (dirty_state.alpha_to_coverage_enable) {
+		dirty_state.alpha_to_coverage_enable = false;
+		if (graphics.eds3_alpha_to_coverage_enable) {
+			cmdbuf.setAlphaToCoverageEnableEXT(alpha_to_coverage_enable ? VK_TRUE : VK_FALSE);
+		}
+	}
+	const uint32_t blend_count = std::max(color_attachment_count, 1u);
+	if (dirty_state.color_blend_enable) {
+		dirty_state.color_blend_enable = false;
+		if (graphics.eds3_color_blend_enable) {
+			cmdbuf.setColorBlendEnableEXT(0, blend_count, color_blend_enables.data());
+		}
+	}
+	if (dirty_state.color_blend_equation) {
+		dirty_state.color_blend_equation = false;
+		if (graphics.eds3_color_blend_equation) {
+			cmdbuf.setColorBlendEquationEXT(0, blend_count, color_blend_equations.data());
+		}
+	}
+	if (dirty_state.color_write_mask) {
+		dirty_state.color_write_mask = false;
+		if (graphics.eds3_color_write_mask) {
+			cmdbuf.setColorWriteMaskEXT(0, blend_count, color_write_masks.data());
+		}
+	}
 }
 
 } // namespace Libs::Graphics

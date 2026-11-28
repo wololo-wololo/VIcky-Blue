@@ -32,6 +32,14 @@ struct GraphicContext {
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               eds3_polygon_mode                     = false;
+	bool                               eds3_depth_clip_enable                = false;
+	bool                               eds3_depth_clip_negative_one_to_one   = false;
+	bool                               eds3_provoking_vertex_mode            = false;
+	bool                               eds3_alpha_to_coverage_enable         = false;
+	bool                               eds3_color_blend_enable               = false;
+	bool                               eds3_color_blend_equation             = false;
+	bool                               eds3_color_write_mask                 = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;

@@ -29,6 +29,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -797,6 +798,34 @@ static void WindowCreate(WindowContext& context) {
 #endif
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
+	}
+	if (const char* delay_text = std::getenv("KYTY_TEST_CROSS_DELAY_MS"); delay_text != nullptr) {
+		char* end = nullptr;
+		const long delay_ms = std::strtol(delay_text, &end, 10);
+		if (end != delay_text && delay_ms >= 0 && delay_ms <= 300000) {
+			SDL_VirtualJoystickDesc desc;
+			SDL_INIT_INTERFACE(&desc);
+			desc.type       = SDL_JOYSTICK_TYPE_GAMEPAD;
+			desc.naxes      = SDL_GAMEPAD_AXIS_COUNT;
+			desc.nbuttons   = SDL_GAMEPAD_BUTTON_COUNT;
+			desc.button_mask = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
+			desc.axis_mask   = (1u << SDL_GAMEPAD_AXIS_LEFTX) | (1u << SDL_GAMEPAD_AXIS_LEFTY);
+			desc.name       = "Temporary live-test controller";
+			const auto joystick_id = SDL_AttachVirtualJoystick(&desc);
+			auto* const joystick  = joystick_id != 0 ? SDL_OpenJoystick(joystick_id) : nullptr;
+			if (joystick != nullptr) {
+				std::thread([joystick, delay_ms] {
+					std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+					SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_SOUTH, true);
+					SDL_Delay(150);
+					SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_SOUTH, false);
+					SDL_CloseJoystick(joystick);
+				}).detach();
+				LOGF("Temporary live-test controller will press Cross after %ld ms\n", delay_ms);
+			} else {
+				LOGF("Temporary live-test controller setup failed: %s\n", SDL_GetError());
+			}
+		}
 	}
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);

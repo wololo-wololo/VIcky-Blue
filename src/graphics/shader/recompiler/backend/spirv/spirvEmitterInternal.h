@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -121,6 +122,11 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	std::array<uint32_t, 2>                          load_bda_dword_functions {};
+	std::array<std::array<uint32_t, 2>, 3>           load_bda_functions {};
+	std::array<uint32_t, 2>                          minmax_f32_functions {};
+	std::unordered_map<uint64_t, uint32_t>           flushed_f32_denorms;
+	std::unordered_set<const IR::Inst*>              uniform_insts;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
@@ -550,6 +556,8 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineLoadBdaFunctions(EmitterState& state);
+void DefineMinMaxF32Functions(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);

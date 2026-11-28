@@ -69,7 +69,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 }
 
 vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
-	return {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+	return {.pipelineCreationCacheControl = VK_TRUE, .synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
 }
 
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
@@ -253,6 +253,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");
 		check_feature(features13.synchronization2, "synchronization2");
+		check_feature(features13.pipelineCreationCacheControl, "pipelineCreationCacheControl");
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
@@ -403,15 +404,19 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
 	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
-	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
+	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+	                   vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
-	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	       acceleration_structure, ray_query, cooperative_matrix, float8, eds3] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+	if (!add(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+	}
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}
@@ -531,7 +536,21 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
-	graphics.maintenance8_enabled             = maintenance8.maintenance8;
+	graphics.eds3_polygon_mode                = eds3.extendedDynamicState3PolygonMode == VK_TRUE;
+#if !defined(__APPLE__)
+	graphics.eds3_depth_clip_enable           = eds3.extendedDynamicState3DepthClipEnable == VK_TRUE;
+#endif
+	graphics.eds3_depth_clip_negative_one_to_one =
+	    eds3.extendedDynamicState3DepthClipNegativeOneToOne == VK_TRUE;
+	graphics.eds3_provoking_vertex_mode =
+	    graphics.provoking_vertex_last_enabled &&
+	    eds3.extendedDynamicState3ProvokingVertexMode == VK_TRUE;
+	graphics.eds3_alpha_to_coverage_enable =
+	    eds3.extendedDynamicState3AlphaToCoverageEnable == VK_TRUE;
+	graphics.eds3_color_blend_enable   = eds3.extendedDynamicState3ColorBlendEnable == VK_TRUE;
+	graphics.eds3_color_blend_equation = eds3.extendedDynamicState3ColorBlendEquation == VK_TRUE;
+	graphics.eds3_color_write_mask     = eds3.extendedDynamicState3ColorWriteMask == VK_TRUE;
+	graphics.maintenance8_enabled      = maintenance8.maintenance8;
 	graphics.ray_query_enabled                = ray_query_enabled;
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
@@ -554,6 +573,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	LOGF("Vulkan EDS3: poly=%s depth_clip=%s neg_one=%s provoking=%s a2c=%s blend_en=%s "
+	     "blend_eq=%s write_mask=%s\n",
+	     graphics.eds3_polygon_mode ? "true" : "false",
+	     graphics.eds3_depth_clip_enable ? "true" : "false",
+	     graphics.eds3_depth_clip_negative_one_to_one ? "true" : "false",
+	     graphics.eds3_provoking_vertex_mode ? "true" : "false",
+	     graphics.eds3_alpha_to_coverage_enable ? "true" : "false",
+	     graphics.eds3_color_blend_enable ? "true" : "false",
+	     graphics.eds3_color_blend_equation ? "true" : "false",
+	     graphics.eds3_color_write_mask ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -639,6 +668,22 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                                        .pEnabledFeatures        = &device_features};
 	provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 	image_atomic_int64.sparseImageInt64Atomics                 = VK_FALSE;
+	vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT eds3_enable {};
+	eds3_enable.extendedDynamicState3PolygonMode         = graphics.eds3_polygon_mode;
+	eds3_enable.extendedDynamicState3DepthClipEnable     = graphics.eds3_depth_clip_enable;
+	eds3_enable.extendedDynamicState3DepthClipNegativeOneToOne =
+	    graphics.eds3_depth_clip_negative_one_to_one;
+	eds3_enable.extendedDynamicState3ProvokingVertexMode = graphics.eds3_provoking_vertex_mode;
+	eds3_enable.extendedDynamicState3AlphaToCoverageEnable =
+	    graphics.eds3_alpha_to_coverage_enable;
+	eds3_enable.extendedDynamicState3ColorBlendEnable    = graphics.eds3_color_blend_enable;
+	eds3_enable.extendedDynamicState3ColorBlendEquation  = graphics.eds3_color_blend_equation;
+	eds3_enable.extendedDynamicState3ColorWriteMask      = graphics.eds3_color_write_mask;
+	const bool any_eds3 =
+	    graphics.eds3_polygon_mode || graphics.eds3_depth_clip_enable ||
+	    graphics.eds3_depth_clip_negative_one_to_one || graphics.eds3_provoking_vertex_mode ||
+	    graphics.eds3_alpha_to_coverage_enable || graphics.eds3_color_blend_enable ||
+	    graphics.eds3_color_blend_equation || graphics.eds3_color_write_mask;
 	// Robustness2 enables what the device has; selection requires nullDescriptor.
 	vk::StructureChain create {
 	    create_info, WindowContext::RequiredVulkan11Features(), features12, features13, robustness2,
@@ -656,7 +701,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    eds3_enable};
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}
@@ -692,6 +738,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+	}
+	if (!any_eds3) {
+		create.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
 	}
 	if (!cooperative_matrix.cooperativeMatrix) {
 		create.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();

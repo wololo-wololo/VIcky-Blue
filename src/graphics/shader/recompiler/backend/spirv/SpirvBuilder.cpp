@@ -62,6 +62,51 @@ uint32_t Builder::Import(const char* name) {
 	return id;
 }
 
+static uint32_t HashWords(std::span<const uint32_t> words) {
+	uint32_t h = 2166136261u;
+	for (const uint32_t w: words) {
+		h ^= w;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+uint32_t Builder::FindOrInsertDeclaration(std::span<const uint32_t> key, bool& inserted) {
+	if (m_declaration_buckets.empty() ||
+	    (m_declaration_entries.size() + 1u) * 2u >= m_declaration_buckets.size()) {
+		const size_t new_cap =
+		    m_declaration_buckets.empty() ? 256u : m_declaration_buckets.size() * 2u;
+		m_declaration_buckets.assign(new_cap, 0u);
+		const size_t mask = new_cap - 1u;
+		for (uint32_t i = 0; i < m_declaration_entries.size(); ++i) {
+			size_t slot = m_declaration_entries[i].hash & mask;
+			while (m_declaration_buckets[slot] != 0u) slot = (slot + 1u) & mask;
+			m_declaration_buckets[slot] = i + 1u;
+		}
+	}
+	const uint32_t hash = HashWords(key);
+	const size_t   mask = m_declaration_buckets.size() - 1u;
+	size_t         slot = hash & mask;
+	while (m_declaration_buckets[slot] != 0u) {
+		const auto& entry = m_declaration_entries[m_declaration_buckets[slot] - 1u];
+		if (entry.hash == hash && entry.count == key.size() &&
+		    std::memcmp(m_declaration_key_pool.data() + entry.offset, key.data(),
+		                key.size() * sizeof(uint32_t)) == 0) {
+			inserted = false;
+			return entry.id;
+		}
+		slot = (slot + 1u) & mask;
+	}
+	const auto id     = AllocateId();
+	const auto offset = static_cast<uint32_t>(m_declaration_key_pool.size());
+	m_declaration_key_pool.insert(m_declaration_key_pool.end(), key.begin(), key.end());
+	const auto index = static_cast<uint32_t>(m_declaration_entries.size());
+	m_declaration_entries.push_back({offset, static_cast<uint32_t>(key.size()), hash, id});
+	m_declaration_buckets[slot] = index + 1u;
+	inserted                    = true;
+	return id;
+}
+
 uint32_t Builder::DeclareType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations) {
 	const auto operand_count = m_key[1];
 	m_key.push_back(static_cast<uint32_t>(annotations.size()));
@@ -70,13 +115,13 @@ uint32_t Builder::DeclareType(spv::Op opcode, std::initializer_list<TypeAnnotati
 		m_key.push_back(static_cast<uint32_t>(annotation.operands.size()));
 		m_key.insert(m_key.end(), annotation.operands.begin(), annotation.operands.end());
 	}
-	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
-		return it->second;
+	bool       inserted = false;
+	const auto id       = FindOrInsertDeclaration(m_key, inserted);
+	if (!inserted) {
+		return id;
 	}
-	const auto id = AllocateId();
 	AppendInstruction(m_declarations, opcode, id,
 	                  std::span<const uint32_t>(m_key).subspan(2, operand_count));
-	m_declaration_ids.emplace(m_key, id);
 	for (const auto& annotation: annotations) {
 		AppendInstruction(m_annotations, annotation.opcode, id, annotation.operands);
 	}
@@ -84,13 +129,13 @@ uint32_t Builder::DeclareType(spv::Op opcode, std::initializer_list<TypeAnnotati
 }
 
 uint32_t Builder::DeclareConstant(spv::Op opcode) {
-	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
-		return it->second;
+	bool       inserted = false;
+	const auto id       = FindOrInsertDeclaration(m_key, inserted);
+	if (!inserted) {
+		return id;
 	}
-	const auto id = AllocateId();
 	AppendInstruction(m_declarations, opcode, m_key[1], id,
 	                  std::span<const uint32_t>(m_key).subspan(2));
-	m_declaration_ids.emplace(m_key, id);
 	return id;
 }
 

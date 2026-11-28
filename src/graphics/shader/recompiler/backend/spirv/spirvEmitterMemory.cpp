@@ -182,8 +182,7 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
-	auto&      state   = ctx.state;
+uint32_t EmitLoadBdaDwordBody(EmitterState& state, uint32_t address, bool coherent) {
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
@@ -219,13 +218,23 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
-                 bool coherent = false) {
-	auto& state = ctx.state;
+uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
+	return EmitLoadBdaDwordBody(ctx.state, address, coherent);
+}
+
+uint32_t CallLoadBdaDword(EmitterState& state, uint32_t address, bool coherent = false) {
+	if (const auto func = state.load_bda_dword_functions[coherent ? 1u : 0u]; func != 0u) {
+		return EmitNative<spv::OpFunctionCall, IR::Type::U32>(state, func, address);
+	}
+	return EmitLoadBdaDwordBody(state, address, coherent);
+}
+
+uint32_t EmitLoadBdaBody(EmitterState& state, uint32_t address, uint32_t active, uint32_t bits,
+                         bool coherent) {
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned, coherent);
+		const auto first   = CallLoadBdaDword(state, aligned, coherent);
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
@@ -234,8 +243,10 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
 		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))), coherent);
+			return CallLoadBdaDword(state,
+			                        Binary(state, spv::OpIAdd, TypeU64(state), aligned,
+			                               ConstantU64(state, sizeof(uint32_t))),
+			                        coherent);
 		});
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
@@ -253,6 +264,15 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
 		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
+}
+
+uint32_t CallLoadBda(EmitterState& state, uint32_t address, uint32_t active, uint32_t bits,
+                     bool coherent = false) {
+	const size_t bits_idx = bits == 8u ? 0u : bits == 16u ? 1u : 2u;
+	if (const auto func = state.load_bda_functions[bits_idx][coherent ? 1u : 0u]; func != 0u) {
+		return EmitNative<spv::OpFunctionCall, IR::Type::U32>(state, func, address, active);
+	}
+	return EmitLoadBdaBody(state, address, active, bits, coherent);
 }
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -991,7 +1011,7 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                                     ctx.Arg(handle, 0), ConstantU32(state, ~3u)),
 		                              Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1,
 		                                     ConstantU32(state, 0xffffu)));
-		    return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), base, offset));
+		    return CallLoadBdaDword(state, Binary(state, spv::OpIAdd, TypeU64(state), base, offset));
 	    });
 }
 
@@ -1364,7 +1384,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                      "indirect_buffer_format_geometry");
 		state.builder.AddFunction(spv::OpFunction, result_type,
 		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlMaskNone, function_type);
+		                          spv::FunctionControlDontInlineMask, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
 		const auto result = EmitIndexSwitch(
@@ -1387,7 +1407,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          spv::FunctionControlDontInlineMask, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1460,7 +1480,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			                          spv::FunctionControlDontInlineMask, signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
@@ -1477,6 +1497,108 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	}
 }
 
+void DefineLoadBdaFunctions(EmitterState& state) {
+	if (!state.program.info.uses_dma) {
+		return;
+	}
+	bool     need_dword[2]  = {};
+	bool     need_bda[3][2] = {};
+	uint32_t scalar_count   = 0u;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op == IR::ValueOpcode::ReadConstBuffer) {
+				if (state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).kind ==
+				    IR::ResourceKind::IndirectBuffer) {
+					++scalar_count;
+				}
+				continue;
+			}
+			if (op != IR::ValueOpcode::LoadAddressU8 && op != IR::ValueOpcode::LoadAddressU16 &&
+			    op != IR::ValueOpcode::LoadAddressU32) {
+				continue;
+			}
+			const auto& mem = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if ((op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) ||
+			    mem.kind == IR::ResourceKind::Scratch) {
+				continue;
+			}
+			if (mem.kind == IR::ResourceKind::ScalarAddress) {
+				++scalar_count;
+			} else {
+				const uint32_t bits     = IR::AddressOpcodeInfoOf(op).data_bits;
+				const size_t   bits_idx = bits == 8u ? 0u : bits == 16u ? 1u : 2u;
+				const size_t   coh      = mem.coherent ? 1u : 0u;
+				need_dword[coh]         = true;
+				need_bda[bits_idx][coh] = true;
+			}
+		}
+	}
+	if (scalar_count >= 4u) {
+		need_dword[0] = true;
+	}
+	if (!need_dword[0] && !need_dword[1] && !need_bda[0][0] && !need_bda[0][1] &&
+	    !need_bda[1][0] && !need_bda[1][1] && !need_bda[2][0] && !need_bda[2][1]) {
+		return;
+	}
+	const auto u32_t    = TypeU32(state);
+	const auto u64_t    = TypeU64(state);
+	const auto dword_ft = (need_dword[0] || need_dword[1])
+	                          ? state.builder.Type(spv::OpTypeFunction, u32_t, u64_t)
+	                          : 0u;
+	for (uint32_t coh = 0; coh < 2u; ++coh) {
+		if (!need_dword[coh]) continue;
+		const auto func    = state.builder.AllocateId();
+		const auto address = state.builder.AllocateId();
+		const auto entry   = state.builder.AllocateId();
+		state.builder.AddName(func, coh != 0u ? "load_bda_dword_coherent" : "load_bda_dword");
+		state.builder.AddFunction(spv::OpFunction, u32_t, func, spv::FunctionControlDontInlineMask,
+		                          dword_ft);
+		state.builder.AddFunction(spv::OpFunctionParameter, u64_t, address);
+		EmitLabel(state, entry);
+		state.builder.AddFunction(spv::OpReturnValue,
+		                          EmitLoadBdaDwordBody(state, address, coh != 0u));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+		state.current_label                 = 0;
+		state.load_bda_dword_functions[coh] = func;
+	}
+	const bool any_bda = need_bda[0][0] || need_bda[0][1] || need_bda[1][0] || need_bda[1][1] ||
+	                     need_bda[2][0] || need_bda[2][1];
+	if (!any_bda) {
+		return;
+	}
+	const auto                          bool_t = TypeBool(state);
+	const auto                          bda_ft = state.builder.Type(spv::OpTypeFunction, u32_t, u64_t, bool_t);
+	constexpr std::array<uint32_t, 3>   bit_widths {8u, 16u, 32u};
+	for (size_t b = 0; b < 3u; ++b) {
+		for (uint32_t coh = 0; coh < 2u; ++coh) {
+			if (!need_bda[b][coh]) continue;
+			const auto func    = state.builder.AllocateId();
+			const auto address = state.builder.AllocateId();
+			const auto active  = state.builder.AllocateId();
+			const auto entry   = state.builder.AllocateId();
+			state.builder.AddName(func, coh != 0u
+			                                ? (b == 0u ? "load_bda_u8_coherent"
+			                                   : b == 1u ? "load_bda_u16_coherent"
+			                                             : "load_bda_u32_coherent")
+			                                : (b == 0u ? "load_bda_u8"
+			                                   : b == 1u ? "load_bda_u16"
+			                                             : "load_bda_u32"));
+			state.builder.AddFunction(spv::OpFunction, u32_t, func, spv::FunctionControlDontInlineMask,
+			                          bda_ft);
+			state.builder.AddFunction(spv::OpFunctionParameter, u64_t, address);
+			state.builder.AddFunction(spv::OpFunctionParameter, bool_t, active);
+			EmitLabel(state, entry);
+			state.builder.AddFunction(
+			    spv::OpReturnValue,
+			    EmitLoadBdaBody(state, address, active, bit_widths[b], coh != 0u));
+			state.builder.AddFunction(spv::OpFunctionEnd);
+			state.current_label              = 0;
+			state.load_bda_functions[b][coh] = func;
+		}
+	}
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
@@ -1488,7 +1610,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto entry_label     = state.builder.AllocateId();
 	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
 	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          spv::FunctionControlDontInlineMask, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
@@ -1782,11 +1904,11 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
-		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+		value = CallLoadBdaDword(ctx.state, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
-		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
-		                address_info.data_bits, mem.coherent);
+		value = CallLoadBda(ctx.state, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
+		                    address_info.data_bits, mem.coherent);
 	else if (inst.GetType() == IR::Type::U8)
 		value = LoadSubword(ctx, inst, mem, 8);
 	else if (inst.GetType() == IR::Type::U16)

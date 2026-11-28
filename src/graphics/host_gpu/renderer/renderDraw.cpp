@@ -1124,7 +1124,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	PipelineStaticParameters live_static_params {};
+	uint32_t                 live_color_count = 0;
+	auto&                    pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+        buffer, state, m_targets, &live_static_params, &live_color_count);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1189,6 +1192,43 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+	if (!mesh_active) {
+		dynamic_state.SetPrimitiveTopology(state.topology);
+		dynamic_state.SetPrimitiveRestartEnable(state.primitive_restart_enable);
+	}
+	static_assert(RENDER_COLOR_ATTACHMENTS_MAX == DynamicState::MaxColorAttachments);
+	dynamic_state.SetPolygonMode(live_static_params.polygon_mode);
+	dynamic_state.SetDepthClipEnable(live_static_params.depth_clip_enable);
+	dynamic_state.SetDepthClipNegativeOneToOne(live_static_params.negative_one_to_one);
+	dynamic_state.SetProvokingVertexMode(live_static_params.provoking_vtx_last
+	                                         ? vk::ProvokingVertexModeEXT::eLastVertex
+	                                         : vk::ProvokingVertexModeEXT::eFirstVertex);
+	dynamic_state.SetAlphaToCoverageEnable(live_static_params.alpha_to_coverage_enable);
+	std::array<vk::Bool32, DynamicState::MaxColorAttachments>              blend_enables {};
+	std::array<vk::ColorBlendEquationEXT, DynamicState::MaxColorAttachments> blend_equations {};
+	std::array<vk::ColorComponentFlags, DynamicState::MaxColorAttachments> color_masks {};
+	for (uint32_t i = 0; i < live_color_count; i++) {
+		blend_enables[i]   = live_static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
+		const auto src_c   = VulkanBlendFactor(live_static_params.color_srcblend[i]);
+		const auto dst_c   = VulkanBlendFactor(live_static_params.color_destblend[i]);
+		const auto op_c    = VulkanBlendOp(live_static_params.color_comb_fcn[i]);
+		blend_equations[i] = {
+		    .srcColorBlendFactor = src_c,
+		    .dstColorBlendFactor = dst_c,
+		    .colorBlendOp        = op_c,
+		    .srcAlphaBlendFactor = live_static_params.separate_alpha_blend[i]
+		                               ? VulkanBlendFactor(live_static_params.alpha_srcblend[i])
+		                               : src_c,
+		    .dstAlphaBlendFactor = live_static_params.separate_alpha_blend[i]
+		                               ? VulkanBlendFactor(live_static_params.alpha_destblend[i])
+		                               : dst_c,
+		    .alphaBlendOp        = live_static_params.separate_alpha_blend[i]
+		                               ? VulkanBlendOp(live_static_params.alpha_comb_fcn[i])
+		                               : op_c,
+		};
+		color_masks[i] = vk::ColorComponentFlags {live_static_params.color_mask[i]};
+	}
+	dynamic_state.SetColorBlendState(live_color_count, blend_enables, blend_equations, color_masks);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
 	vk::PipelineStageFlags shader_write_stages = {};
