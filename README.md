@@ -104,8 +104,8 @@ Known state:
   ([#41](https://github.com/wololo-wololo/VIcky-Blue/issues/41)).
 - Objects no longer pop in and out in the intro and the cell. Deleting an unknown voice port used to
   succeed; the title treats that success as a reason to keep only a random half, quarter or eighth
-  of its scene list each frame. Fixed in the branch for
-  [#22](https://github.com/wololo-wololo/VIcky-Blue/issues/22), not merged yet.
+  of its scene list each frame. Fixed for
+  [#22](https://github.com/wololo-wololo/VIcky-Blue/issues/22).
 
 Resolved since the last status: the shader decode abort right after the loading logo
 ([#1](https://github.com/wololo-wololo/VIcky-Blue/issues/1), fixed in `f5d84d2b`), which was the previous boot blocker, and the GPU flip
