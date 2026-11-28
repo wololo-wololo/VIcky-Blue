@@ -871,7 +871,70 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+namespace {
+
+// KYTY_FLIP_PEEK=<addr>[@<offset>][,...] prints one line per flip with the frame and one guest
+// dword per entry: the dword at addr, or with @offset the dword at offset from the address stored
+// in the qword at addr. -1 means unreadable. Used to log the length of guest lists per frame.
+struct FlipPeek {
+	struct Entry {
+		uint64_t address  = 0;
+		uint64_t offset   = 0;
+		bool     indirect = false;
+	};
+	std::vector<Entry> entries = [] {
+		std::vector<Entry> list;
+		const char*        text = std::getenv("KYTY_FLIP_PEEK");
+		while (text != nullptr && *text != '\0') {
+			char* end   = nullptr;
+			Entry entry = {std::strtoull(text, &end, 0)};
+			if (end == text) {
+				break;
+			}
+			if (*end == '@') {
+				text           = end + 1;
+				entry.offset   = std::strtoull(text, &end, 0);
+				entry.indirect = true;
+			}
+			list.push_back(entry);
+			text = (*end == ',') ? end + 1 : end;
+		}
+		return list;
+	}();
+
+	void Print() const {
+		if (entries.empty()) {
+			return;
+		}
+		char   line[512];
+		size_t used = static_cast<size_t>(std::snprintf(line, sizeof(line), "flip peek: frame %llu",
+		                                                static_cast<unsigned long long>(DrawDumpFrameIndex())));
+		for (const auto& entry: entries) {
+			int64_t  value   = -1;
+			uint64_t address = entry.address;
+			if (entry.indirect) {
+				address = (LibKernel::Memory::ReadableHostBytes(address, 8) == 8)
+				              ? *reinterpret_cast<const uint64_t*>(address) + entry.offset
+				              : 0;
+			}
+			if (address != 0 && LibKernel::Memory::ReadableHostBytes(address, 4) == 4) {
+				value = *reinterpret_cast<const uint32_t*>(address);
+			}
+			if (used < sizeof(line)) {
+				used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, " %lld",
+				                                          static_cast<long long>(value)));
+			}
+		}
+		std::fprintf(stderr, "%s\n", line);
+	}
+};
+
+const FlipPeek g_flip_peek;
+
+} // namespace
+
 void RenderContext::WriteWatchFlip() {
+	g_flip_peek.Print();
 	if (g_write_watch.Enabled()) {
 		g_write_watch.Flip(m_page_manager,
 		                   [this](uint64_t page) { return IsMapped(page, 0x1000); });
