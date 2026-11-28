@@ -18,6 +18,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <string>
 #include <unordered_map>
 #include <xxhash.h>
 
@@ -225,6 +226,10 @@ struct BufferReadLog {
 // that moment, and the page is unprotected until the next write fault on a watched fixed range
 // (the draw jobs write command buffers between their reads) or the next flip. One line per frame,
 // slot and instruction gives the count and the bit range seen.
+// A slot can be written <slot>[@<offset>...][+<add>][:<bits>]: each @offset reads the next pointer
+// at that offset from the previous one, +add is added to the final address, and :bits gives that
+// slot's own array size. Each first write inside a slot's array also prints a line with the frame,
+// the slot, the written address and the writer's chain.
 struct WriteWatch {
 	struct Range {
 		uint64_t begin = 0;
@@ -258,6 +263,9 @@ struct WriteWatch {
 	};
 	struct Pointer {
 		uint64_t slot       = 0;
+		std::vector<uint64_t> derefs;
+		uint64_t add        = 0;
+		uint64_t own_bits   = 0;
 		uint64_t target     = 0;
 		uint64_t bytes      = 0;
 		uint64_t bits       = 0;
@@ -276,7 +284,21 @@ struct WriteWatch {
 			if (end == text) {
 				break;
 			}
-			list.push_back({slot});
+			Pointer pointer;
+			pointer.slot = slot;
+			while (*end == '@') {
+				text = end + 1;
+				pointer.derefs.push_back(std::strtoull(text, &end, 0));
+			}
+			if (*end == '+') {
+				text        = end + 1;
+				pointer.add = std::strtoull(text, &end, 0);
+			}
+			if (*end == ':') {
+				text             = end + 1;
+				pointer.own_bits = std::strtoull(text, &end, 0);
+			}
+			list.push_back(std::move(pointer));
 			text = (*end == ',') ? end + 1 : end;
 		}
 		return list;
@@ -471,7 +493,16 @@ struct WriteWatch {
 				             static_cast<unsigned long long>(access.max));
 			}
 			pointer.accesses.clear();
-			const auto target = *reinterpret_cast<const uint64_t*>(pointer.slot);
+			auto target = *reinterpret_cast<const uint64_t*>(pointer.slot);
+			for (const auto offset: pointer.derefs) {
+				target = (target != 0 && LibKernel::Memory::ReadableHostBytes(target + offset, 8) == 8)
+				             ? *reinterpret_cast<const uint64_t*>(target + offset)
+				             : 0;
+			}
+			if (target != 0) {
+				target += pointer.add;
+			}
+			const auto slot_bits = std::min<uint64_t>(pointer.own_bits != 0 ? pointer.own_bits : bits, 0x10000);
 			if (pointer_read) {
 				// Unprotected here so the array can be read below; RearmReads() protects it again.
 				if (pointer.read_armed) {
@@ -482,8 +513,8 @@ struct WriteWatch {
 				pointer.read_page = (target != 0 && is_mapped(page)) ? page : 0;
 			}
 			pointer.target = target;
-			pointer.bytes  = (bits + 7) / 8;
-			pointer.bits   = bits;
+			pointer.bytes  = (slot_bits + 7) / 8;
+			pointer.bits   = slot_bits;
 			if (pointer.target == 0 || pointer.bytes == 0) {
 				continue;
 			}
@@ -496,8 +527,8 @@ struct WriteWatch {
 			}
 			std::vector<uint8_t> data(pointer.bytes);
 			std::memcpy(data.data(), reinterpret_cast<const void*>(pointer.target), pointer.bytes);
-			if ((bits & 7u) != 0) {
-				data.back() &= static_cast<uint8_t>((1u << (bits & 7u)) - 1u);
+			if ((slot_bits & 7u) != 0) {
+				data.back() &= static_cast<uint8_t>((1u << (slot_bits & 7u)) - 1u);
 			}
 			uint64_t set = 0;
 			for (const auto byte: data) {
@@ -508,7 +539,7 @@ struct WriteWatch {
 			             "%llu\n",
 			             static_cast<unsigned long long>(DrawDumpFrameIndex()), i,
 			             static_cast<unsigned long long>(pointer.target), static_cast<unsigned long long>(set),
-			             static_cast<unsigned long long>(bits),
+			             static_cast<unsigned long long>(slot_bits),
 			             static_cast<unsigned long long>(XXH3_64bits(data.data(), data.size())),
 			             static_cast<unsigned long long>(pointer.writes));
 			pointer.writes = 0;
@@ -602,6 +633,12 @@ struct WriteWatch {
 				}
 			}
 		}
+		std::string chain_text;
+		for (const auto value: key) {
+			char number[24];
+			std::snprintf(number, sizeof(number), " 0x%llx", static_cast<unsigned long long>(value));
+			chain_text += number;
+		}
 		int range_index = 0;
 		for (size_t i = 0; i < ranges.size(); i++) {
 			if (page >= ranges[i].begin && page < ranges[i].end) {
@@ -610,12 +647,19 @@ struct WriteWatch {
 		}
 		for (size_t i = 0; i < pointers.size(); i++) {
 			auto& pointer = pointers[i];
-			if (pointer.bytes == 0 || page != (pointer.target & ~0xfffull)) {
+			if (pointer.bytes == 0 || page < (pointer.target & ~0xfffull) ||
+			    page >= pointer.target + pointer.bytes) {
 				continue;
 			}
 			const bool inside = vaddr >= pointer.target && vaddr < pointer.target + pointer.bytes;
 			range_index       = static_cast<int>((inside ? 100 : 90) + i);
 			pointer.writes += inside ? 1 : 0;
+			if (inside) {
+				std::fprintf(stderr, "write watch ptr write: frame %llu slot %zu addr 0x%llx (+0x%llx) at%s\n",
+				             static_cast<unsigned long long>(DrawDumpFrameIndex()), i,
+				             static_cast<unsigned long long>(vaddr),
+				             static_cast<unsigned long long>(vaddr - pointer.target), chain_text.c_str());
+			}
 		}
 		auto& chain = chains[key];
 		if (chain.count++ == 0) {
