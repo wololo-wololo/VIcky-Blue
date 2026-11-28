@@ -422,9 +422,16 @@ int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t
 int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 	PRINT_NAME();
 
-	if (auto* port = get_voice_port(port_id); port != nullptr) {
-		*port = {};
+	auto* port = get_voice_port(port_id);
+
+	// An unknown port is an error, as on the console. The target title deletes port 0xff at startup
+	// and, when that succeeds, thins its scene draw list to a random 1/2, 1/4 or 1/8 every frame
+	// (objects popping in and out, issue 22).
+	if (port == nullptr) {
+		return static_cast<int>(0x804E0804u); // port invalid (code numbered like the other voice errors)
 	}
+
+	*port = {};
 
 	return 0;
 }
